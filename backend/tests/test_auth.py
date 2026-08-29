@@ -15,8 +15,8 @@ def test_duplicate_registration_and_unauthenticated_access(client):
     assert client.get("/api/v1/auth/me").status_code == 401
 
 
-def test_registration_creates_a_virtual_portfolio(client):
+def test_registration_creates_an_empty_portfolio(client):
     headers = register_and_login(client)
     portfolio = client.get("/api/v1/portfolio", headers=headers)
     assert portfolio.status_code == 200
-    assert portfolio.json()["cash_balance"] == "1000.00"
+    assert portfolio.json()["total_portfolio_value"] == "0.00"

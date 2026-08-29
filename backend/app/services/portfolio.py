@@ -41,7 +41,7 @@ def realized_profit_loss(transactions: list[Transaction]) -> Decimal:
         if transaction.transaction_type == "BUY":
             combined_quantity = quantity + transaction.quantity
             average_cost = (
-                (quantity * average_cost + transaction.quantity * transaction.price) / combined_quantity
+                (quantity * average_cost + transaction.total_amount) / combined_quantity
             )
             positions[transaction.stock_id] = (combined_quantity, average_cost)
         elif transaction.transaction_type == "SELL":
@@ -49,6 +49,6 @@ def realized_profit_loss(transactions: list[Transaction]) -> Decimal:
             # corrupted legacy data from silently producing a false P/L result.
             if transaction.quantity > quantity:
                 raise ValueError("Transaction ledger contains an oversell")
-            realized += money((transaction.price - average_cost) * transaction.quantity)
+            realized += money(transaction.total_amount - average_cost * transaction.quantity)
             positions[transaction.stock_id] = (quantity - transaction.quantity, average_cost)
     return money(realized)

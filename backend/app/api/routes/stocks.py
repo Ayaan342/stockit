@@ -36,16 +36,25 @@ async def search_stocks(
 
 
 @router.get("/{symbol}", response_model=StockResponse)
-async def stock_details(symbol: str, db: Session = Depends(get_db), market: MarketDataService = Depends(get_market_service)) -> Stock:
+async def stock_details(
+    symbol: str,
+    exchange: str | None = Query(default=None, min_length=1, max_length=50),
+    db: Session = Depends(get_db),
+    market: MarketDataService = Depends(get_market_service),
+) -> Stock:
     try:
-        return await market.get_stock(db, symbol)
+        return await market.get_stock(db, symbol, exchange=exchange)
     except MarketDataError as exc:
         raise provider_error(exc) from exc
 
 
 @router.get("/{symbol}/history", response_model=list[StockHistoryPoint])
-async def stock_history(symbol: str, market: MarketDataService = Depends(get_market_service)) -> list[StockHistoryPoint]:
+async def stock_history(
+    symbol: str,
+    exchange: str | None = Query(default=None, min_length=1, max_length=50),
+    market: MarketDataService = Depends(get_market_service),
+) -> list[StockHistoryPoint]:
     try:
-        return await market.history(symbol)
+        return await market.history(symbol, exchange=exchange)
     except MarketDataError as exc:
         raise provider_error(exc) from exc

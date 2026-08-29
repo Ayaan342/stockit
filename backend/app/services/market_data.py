@@ -181,6 +181,14 @@ def normalize_symbol(symbol: str) -> str:
     return symbol.strip().upper()
 
 
+def provider_symbol(symbol: str, exchange: str | None = None) -> str:
+    """Return the selected Twelve Data listing identifier without guessing an exchange."""
+    normalized_symbol = normalize_symbol(symbol)
+    if ":" in normalized_symbol or not exchange:
+        return normalized_symbol
+    return f"{normalized_symbol}:{exchange.strip().upper()}"
+
+
 class MarketDataService:
     def __init__(self, provider: MarketDataProvider) -> None:
         self.provider = provider
@@ -251,17 +259,26 @@ class MarketDataService:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
 
-    async def get_stock(self, db: Session, symbol: str, *, require_price: bool = False) -> Stock:
+    async def get_stock(self, db: Session, symbol: str, *, exchange: str | None = None, require_price: bool = False) -> Stock:
         symbol = normalize_symbol(symbol)
+        selected_provider_symbol = provider_symbol(symbol, exchange)
         stock = db.scalar(select(Stock).where(Stock.symbol == symbol))
         stale = stock is None or stock.last_price_updated_at is None or (
             datetime.now(timezone.utc) - self._as_utc(stock.last_price_updated_at)
         ).total_seconds() > settings.market_cache_seconds
+        # A cached row represents the bare stock symbol. Refresh when the user
+        # explicitly selected another exchange so Twelve Data resolves that
+        # exact listing rather than an arbitrary symbol match.
+        if exchange:
+            # The cache is keyed by bare symbol, so it cannot prove that its
+            # value belongs to a user-selected listing. Always resolve an
+            # explicit exchange with Twelve Data before returning details.
+            stale = True
         if stale:
-            details = await self.provider.details(symbol)
+            details = await self.provider.details(selected_provider_symbol)
             stock = self._upsert_stock(db, details)
             try:
-                stock.last_price = await self.provider.quote(symbol)
+                stock.last_price = await self.provider.quote(selected_provider_symbol)
                 stock.last_price_updated_at = datetime.now(timezone.utc)
             except MarketDataError:
                 if require_price or stock.last_price is None:
@@ -272,5 +289,5 @@ class MarketDataService:
             raise MarketDataError("No current market price is available")
         return stock
 
-    async def history(self, symbol: str) -> list[StockHistoryPoint]:
-        return await self.provider.history(normalize_symbol(symbol))
+    async def history(self, symbol: str, *, exchange: str | None = None) -> list[StockHistoryPoint]:
+        return await self.provider.history(provider_symbol(symbol, exchange))

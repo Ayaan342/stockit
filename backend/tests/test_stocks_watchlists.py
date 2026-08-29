@@ -1,6 +1,74 @@
 import httpx
+from datetime import datetime, timezone
+from decimal import Decimal
 
 from tests.conftest import register_and_login
+
+
+def test_detail_and_history_use_the_selected_listing_exchange(client):
+    from app.main import app
+    from app.schemas.stock import StockHistoryPoint
+    from app.services.market_data import MarketDataProvider, MarketDataService
+
+    class RecordingProvider(MarketDataProvider):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def search(self, query: str) -> list[dict]:
+            return []
+
+        async def quote(self, symbol: str) -> Decimal:
+            self.calls.append(f"quote:{symbol}")
+            return Decimal("100")
+
+        async def details(self, symbol: str) -> dict:
+            self.calls.append(f"details:{symbol}")
+            base, _, exchange = symbol.partition(":")
+            return {"symbol": base, "name": base, "exchange": exchange or "NASDAQ", "currency": "USD"}
+
+        async def history(self, symbol: str) -> list[StockHistoryPoint]:
+            self.calls.append(f"history:{symbol}")
+            return [StockHistoryPoint(timestamp=datetime.now(timezone.utc), close=Decimal("100"))]
+
+    provider = RecordingProvider()
+    app.state.market_service = MarketDataService(provider)
+    listings = [
+        ("AAPL", "NASDAQ"),
+        ("TCS", "NSE"),
+        ("RELIANCE", "NSE"),
+        ("M&M", "NSE"),
+        ("AAPL", "NEO"),
+        ("TCS:NSE", "NSE"),
+    ]
+    for symbol, exchange in listings:
+        detail = client.get(f"/api/v1/stocks/{symbol}", params={"exchange": exchange})
+        history = client.get(f"/api/v1/stocks/{symbol}/history", params={"exchange": exchange})
+        assert detail.status_code == history.status_code == 200
+        expected = symbol if ":" in symbol else f"{symbol}:{exchange}"
+        assert f"details:{expected}" in provider.calls
+        assert f"history:{expected}" in provider.calls
+
+
+def test_stock_detail_preserves_market_rate_limit_status(client):
+    from app.main import app
+    from app.services.market_data import MarketDataError, MarketDataProvider, MarketDataService
+
+    class LimitedProvider(MarketDataProvider):
+        async def search(self, query: str) -> list[dict]:
+            raise MarketDataError("Market data rate limit reached", status_code=429)
+
+        async def quote(self, symbol: str) -> Decimal:
+            raise MarketDataError("Market data rate limit reached", status_code=429)
+
+        async def details(self, symbol: str) -> dict:
+            raise MarketDataError("Market data rate limit reached", status_code=429)
+
+        async def history(self, symbol: str):
+            raise MarketDataError("Market data rate limit reached", status_code=429)
+
+    app.state.market_service = MarketDataService(LimitedProvider())
+    response = client.get("/api/v1/stocks/AAPL", params={"exchange": "NASDAQ"})
+    assert response.status_code == 429
 
 
 def test_stock_lookup_search_and_history(client):

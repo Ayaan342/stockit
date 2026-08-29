@@ -54,6 +54,9 @@ def transaction_response(transaction: Transaction) -> TransactionResponse:
         quantity=transaction.quantity,
         price=transaction.price,
         total_amount=transaction.total_amount,
+        fees=transaction.fees,
+        notes=transaction.notes,
+        executed_at=transaction.executed_at,
         created_at=transaction.created_at,
     )
 
@@ -71,14 +74,13 @@ async def portfolio_summary(
     )
     total_invested = money(sum((item.invested_value for item in holdings), Decimal("0")))
     current_holdings_value = money(sum((item.current_value for item in holdings), Decimal("0")))
-    total_value = money(current_user.virtual_cash_balance + current_holdings_value)
+    total_value = current_holdings_value
     unrealized = money(sum((item.profit_loss for item in holdings), Decimal("0")))
     realized = realized_profit_loss(transactions)
     profit_loss = money(realized + unrealized)
     percentage = None if total_invested == 0 else (profit_loss / total_invested * Decimal("100")).quantize(Decimal("0.01"))
     return PortfolioResponse(
         portfolio_id=portfolio.id,
-        cash_balance=current_user.virtual_cash_balance,
         total_invested=total_invested,
         current_holdings_value=current_holdings_value,
         realized_profit_loss=realized,
@@ -119,30 +121,26 @@ async def buy(
     payload: TradeRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db), market: MarketDataService = Depends(get_market_service)
 ) -> TransactionResponse:
     try:
-        stock = await market.get_stock(db, normalize_symbol(payload.symbol), require_price=True)
+        stock = await market.get_stock(db, normalize_symbol(payload.symbol))
     except MarketDataError as exc:
         raise provider_error(exc) from exc
     try:
-        # Lock the user and portfolio rows so simultaneous orders cannot overspend cash.
-        user = db.scalar(select(User).where(User.id == current_user.id).with_for_update())
         portfolio = get_portfolio(db, current_user.id, lock=True)
         holding = db.scalar(
             select(Holding).where(Holding.portfolio_id == portfolio.id, Holding.stock_id == stock.id).with_for_update()
         )
-        total = money(payload.quantity * stock.last_price)
-        if user is None or user.virtual_cash_balance < total:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Insufficient virtual cash")
-        user.virtual_cash_balance = money(user.virtual_cash_balance - total)
+        total = money(payload.quantity * payload.price + payload.fees)
         if holding is None:
-            holding = Holding(portfolio_id=portfolio.id, stock_id=stock.id, quantity=payload.quantity, average_buy_price=stock.last_price)
+            holding = Holding(portfolio_id=portfolio.id, stock_id=stock.id, quantity=payload.quantity, average_buy_price=total / payload.quantity)
             db.add(holding)
         else:
             combined_quantity = holding.quantity + payload.quantity
-            holding.average_buy_price = (holding.quantity * holding.average_buy_price + payload.quantity * stock.last_price) / combined_quantity
+            holding.average_buy_price = (holding.quantity * holding.average_buy_price + total) / combined_quantity
             holding.quantity = combined_quantity
         transaction = Transaction(
-            user_id=user.id, portfolio_id=portfolio.id, stock_id=stock.id, transaction_type="BUY",
-            quantity=payload.quantity, price=stock.last_price, total_amount=total,
+            user_id=current_user.id, portfolio_id=portfolio.id, stock_id=stock.id, transaction_type="BUY",
+            quantity=payload.quantity, price=payload.price, total_amount=total, fees=payload.fees, notes=payload.notes,
+            executed_at=payload.executed_at or datetime.now(timezone.utc),
         )
         db.add(transaction)
         db.commit()
@@ -162,27 +160,28 @@ async def sell(
     payload: TradeRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db), market: MarketDataService = Depends(get_market_service)
 ) -> TransactionResponse:
     try:
-        stock = await market.get_stock(db, normalize_symbol(payload.symbol), require_price=True)
+        stock = await market.get_stock(db, normalize_symbol(payload.symbol))
     except MarketDataError as exc:
         raise provider_error(exc) from exc
     try:
-        user = db.scalar(select(User).where(User.id == current_user.id).with_for_update())
         portfolio = get_portfolio(db, current_user.id, lock=True)
         holding = db.scalar(
             select(Holding).where(Holding.portfolio_id == portfolio.id, Holding.stock_id == stock.id).with_for_update()
         )
-        if user is None or holding is None:
+        if holding is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No holding exists for this stock")
         if payload.quantity > holding.quantity:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Sell quantity exceeds owned shares")
-        total = money(payload.quantity * stock.last_price)
-        user.virtual_cash_balance = money(user.virtual_cash_balance + total)
+        total = money(payload.quantity * payload.price - payload.fees)
+        if total < 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Fees cannot exceed sale proceeds")
         holding.quantity -= payload.quantity
         if holding.quantity == 0:
             db.delete(holding)
         transaction = Transaction(
-            user_id=user.id, portfolio_id=portfolio.id, stock_id=stock.id, transaction_type="SELL",
-            quantity=payload.quantity, price=stock.last_price, total_amount=total,
+            user_id=current_user.id, portfolio_id=portfolio.id, stock_id=stock.id, transaction_type="SELL",
+            quantity=payload.quantity, price=payload.price, total_amount=total, fees=payload.fees, notes=payload.notes,
+            executed_at=payload.executed_at or datetime.now(timezone.utc),
         )
         db.add(transaction)
         db.commit()
