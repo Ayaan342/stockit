@@ -33,23 +33,40 @@ export interface Watchlist {
 export interface Holding {
   symbol: string
   name: string
+  exchange: string
+  currency: string
   quantity: string
   average_buy_price: string
-  current_market_price: string
+  current_market_price: string | null
   invested_value: string
-  current_value: string
-  profit_loss: string
+  current_value: string | null
+  profit_loss: string | null
   profit_loss_percentage: string | null
+  allocation_percentage: string | null
+}
+
+export interface PortfolioCurrencyGroup {
+  currency: string
+  market_group: string
+  total_invested: string
+  current_holdings_value: string | null
+  realized_profit_loss: string
+  unrealized_profit_loss: string | null
+  total_portfolio_value: string | null
+  total_profit_loss: string | null
+  profit_loss_percentage: string | null
+  number_of_assets: number
 }
 
 export interface Portfolio {
   portfolio_id: number
-  total_invested: string
-  current_holdings_value: string
-  realized_profit_loss: string
-  unrealized_profit_loss: string
-  total_portfolio_value: string
-  total_profit_loss: string
+  groups: PortfolioCurrencyGroup[]
+  total_invested: string | null
+  current_holdings_value: string | null
+  realized_profit_loss: string | null
+  unrealized_profit_loss: string | null
+  total_portfolio_value: string | null
+  total_profit_loss: string | null
   profit_loss_percentage: string | null
   day_change: string | null
 }
@@ -57,6 +74,8 @@ export interface Portfolio {
 export interface Transaction {
   id: number
   symbol: string
+  exchange: string
+  currency: string
   transaction_type: 'BUY' | 'SELL'
   quantity: string
   price: string

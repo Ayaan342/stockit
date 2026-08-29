@@ -29,11 +29,10 @@ export function DashboardPage() {
   if (error) return <ErrorState message={error} />
   if (!portfolio) return <Loading />
 
-  const totalHoldingValue = Number(portfolio.current_holdings_value)
-  const allocation = totalHoldingValue > 0
-    ? holdings.map((holding) => ({ ...holding, value: Number(holding.current_value), percentage: Number(holding.current_value) / totalHoldingValue * 100 })).filter((holding) => holding.value > 0)
+  const allocation = new Set(holdings.map((holding) => holding.currency)).size === 1 && holdings.every((holding) => holding.current_value !== null && holding.allocation_percentage !== null)
+    ? holdings.map((holding) => ({ ...holding, value: Number(holding.current_value), percentage: Number(holding.allocation_percentage) })).filter((holding) => holding.value > 0)
     : []
-  const rankedHoldings = [...holdings].sort((left, right) => Number(right.profit_loss) - Number(left.profit_loss))
+  const rankedHoldings = [...holdings].filter((holding) => holding.profit_loss !== null).sort((left, right) => Number(right.profit_loss) - Number(left.profit_loss))
   const bestHolding = rankedHoldings[0]
   const worstHolding = rankedHoldings[rankedHoldings.length - 1]
 
@@ -42,20 +41,20 @@ export function DashboardPage() {
       <div><p className="eyebrow">Analytics</p><h1>Portfolio insights</h1><p className="muted">A real-time summary based on your current portfolio and activity.</p></div>
       <Link className="primary" to="/portfolio">View portfolio</Link>
     </section>
-    <section className="metric-grid dashboard-metrics">
-      <MetricCard featured label="Total portfolio value" value={money(portfolio.total_portfolio_value)} detail="Cash and current holdings" />
-      <MetricCard label="Holdings value" value={money(portfolio.current_holdings_value)} />
-      <MetricCard label="Total invested" value={money(portfolio.total_invested)} />
-      <MetricCard label="Total P/L" tone={pnlClass(portfolio.total_profit_loss)} value={money(portfolio.total_profit_loss)} detail={portfolio.profit_loss_percentage ? `${portfolio.profit_loss_percentage}% overall` : 'No percentage yet'} />
-    </section>
+    {portfolio.groups.map((group) => <section key={group.currency}><div className="panel-heading"><div><p className="eyebrow">{group.market_group}</p><h2>{group.currency} summary</h2></div></div><section className="metric-grid dashboard-metrics">
+      <MetricCard featured label="Portfolio value" value={money(group.total_portfolio_value, group.currency)} detail={group.total_portfolio_value === null ? 'Market data unavailable' : 'Current holdings'} />
+      <MetricCard label="Holdings value" value={money(group.current_holdings_value, group.currency)} />
+      <MetricCard label="Total invested" value={money(group.total_invested, group.currency)} />
+      <MetricCard label="Total P/L" tone={pnlClass(group.total_profit_loss)} value={money(group.total_profit_loss, group.currency)} detail={group.profit_loss_percentage === null ? 'Market data unavailable' : `${group.profit_loss_percentage}% overall`} />
+    </section></section>)}
     <section className="dashboard-main">
       <article className="panel performance-panel">
         <div className="panel-heading"><div><h2>Profit & loss</h2><p className="muted">Current backend-calculated valuation</p></div><Link to="/portfolio">View portfolio</Link></div>
         <dl className="key-values">
-          <div><dt>Holdings value</dt><dd>{money(portfolio.current_holdings_value)}</dd></div>
-          <div><dt>Realized P/L</dt><dd className={pnlClass(portfolio.realized_profit_loss)}>{money(portfolio.realized_profit_loss)}</dd></div>
-          <div><dt>Unrealized P/L</dt><dd className={pnlClass(portfolio.unrealized_profit_loss)}>{money(portfolio.unrealized_profit_loss)}</dd></div>
-          <div><dt>Overall return</dt><dd className={pnlClass(portfolio.profit_loss_percentage)}>{portfolio.profit_loss_percentage ? `${portfolio.profit_loss_percentage}%` : '—'}</dd></div>
+          <div><dt>Holdings value</dt><dd>{portfolio.groups.length === 1 ? money(portfolio.groups[0].current_holdings_value, portfolio.groups[0].currency) : 'See currency summaries'}</dd></div>
+          <div><dt>Realized P/L</dt><dd>{portfolio.groups.length === 1 ? money(portfolio.groups[0].realized_profit_loss, portfolio.groups[0].currency) : 'See currency summaries'}</dd></div>
+          <div><dt>Unrealized P/L</dt><dd>{portfolio.groups.length === 1 ? money(portfolio.groups[0].unrealized_profit_loss, portfolio.groups[0].currency) : '—'}</dd></div>
+          <div><dt>Overall return</dt><dd>{portfolio.groups.length === 1 && portfolio.groups[0].profit_loss_percentage !== null ? `${portfolio.groups[0].profit_loss_percentage}%` : '—'}</dd></div>
         </dl>
         {bestHolding && worstHolding && <div className="holding-extremes"><span>Best: <b className={pnlClass(bestHolding.profit_loss)}>{bestHolding.symbol} · {money(bestHolding.profit_loss)}</b></span><span>Lowest: <b className={pnlClass(worstHolding.profit_loss)}>{worstHolding.symbol} · {money(worstHolding.profit_loss)}</b></span></div>}
       </article>
@@ -64,12 +63,12 @@ export function DashboardPage() {
         {allocation.length ? <>
           <div className="allocation-chart"><ResponsiveContainer width="100%" height={190}><PieChart><Pie data={allocation} dataKey="value" nameKey="symbol" innerRadius={52} outerRadius={76} paddingAngle={2} strokeWidth={0}>{allocation.map((holding, index) => <Cell key={holding.symbol} fill={allocationColors[index % allocationColors.length]} />)}</Pie><Tooltip /></PieChart></ResponsiveContainer><div className="donut-center"><span>Holdings</span><strong>{money(portfolio.current_holdings_value)}</strong></div></div>
           <div className="allocation-legend">{allocation.map((holding, index) => <div key={holding.symbol}><i style={{ background: allocationColors[index % allocationColors.length] }} /><strong>{holding.symbol}</strong><span>{money(holding.current_value)} · {number(holding.percentage)}%</span></div>)}</div>
-        </> : <p className="muted compact-empty">No holdings yet. Buy stocks to build your allocation.</p>}
+        </> : <p className="muted compact-empty">{holdings.length ? 'Allocation is shown separately by currency when market data is available.' : 'No holdings yet. Buy stocks to build your allocation.'}</p>}
       </article>
     </section>
     <section className="dashboard-lower">
       <article className="panel"><div className="panel-heading"><h2>Watchlists</h2><Link to="/watchlists">Manage</Link></div>{watchlists.length ? <ul className="simple-list">{watchlists.slice(0, 4).map((list) => <li key={list.id}><span className="list-mark">{list.name.charAt(0).toUpperCase()}</span><strong>{list.name}</strong><span>{list.stocks.length} stocks</span></li>)}</ul> : <p className="muted">Create a watchlist to keep an eye on stocks.</p>}</article>
-      <article className="panel"><div className="panel-heading"><h2>Recent transactions</h2><Link to="/transactions">View all</Link></div>{transactions.length ? <div className="compact-transactions">{transactions.slice(0, 4).map((transaction) => <div key={transaction.id}><span className={`badge ${transaction.transaction_type.toLowerCase()}`}>{transaction.transaction_type}</span><strong>{transaction.symbol}</strong><span>{number(transaction.quantity)} {Number(transaction.quantity) === 1 ? 'share' : 'shares'}</span><b>{money(transaction.total_amount)}</b><small>{dateTime(transaction.created_at)}</small></div>)}</div> : <p className="muted">No transactions yet.</p>}</article>
+      <article className="panel"><div className="panel-heading"><h2>Recent transactions</h2><Link to="/transactions">View all</Link></div>{transactions.length ? <div className="compact-transactions">{transactions.slice(0, 4).map((transaction) => <div key={transaction.id}><span className={`badge ${transaction.transaction_type.toLowerCase()}`}>{transaction.transaction_type}</span><strong>{transaction.symbol} · {transaction.exchange}</strong><span>{number(transaction.quantity)} {Number(transaction.quantity) === 1 ? 'share' : 'shares'}</span><b>{money(transaction.total_amount, transaction.currency)}</b><small>{dateTime(transaction.created_at)}</small></div>)}</div> : <p className="muted">No transactions yet.</p>}</article>
     </section>
   </>
 }
