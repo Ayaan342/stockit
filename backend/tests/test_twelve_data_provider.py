@@ -1,9 +1,10 @@
 import asyncio
+from decimal import Decimal
 
 import httpx
 import pytest
 
-from app.services.market_data import MarketDataError, TwelveDataProvider
+from app.services.market_data import MarketDataError, MarketDataProvider, MarketDataService, SymbolNormalizer, TwelveDataProvider, YahooFinanceProvider
 
 
 def provider_with(handler) -> TwelveDataProvider:
@@ -108,3 +109,46 @@ def test_twelve_data_provider_failure_is_not_exposed():
         asyncio.run(failing.quote("AAPL"))
     assert error.value.status_code == 503
     assert error.value.public_detail == "Market data provider is currently unavailable"
+
+
+def test_yahoo_fallback_is_conditional_and_uses_nse_suffix():
+    class FailingPrimary(MarketDataProvider):
+        async def search(self, query: str): raise MarketDataError(status_code=503)
+        async def quote(self, symbol: str): raise MarketDataError(status_code=503)
+        async def details(self, symbol: str): raise MarketDataError(status_code=503)
+        async def history(self, symbol: str): raise MarketDataError(status_code=503)
+
+    requested: list[str] = []
+    class Ticker:
+        fast_info = {"last_price": "3500.50"}
+    fallback = YahooFinanceProvider(ticker_factory=lambda symbol: requested.append(symbol) or Ticker())
+    service = MarketDataService(FailingPrimary(), fallback)
+    assert asyncio.run(service._primary_or_fallback("quote", "TCS:NSE")) == Decimal("3500.50")
+    assert requested == ["TCS.NS"]
+
+    class DetailsTicker:
+        info = {"longName": "Tata Consultancy Services", "currency": "INR"}
+    details_requested: list[str] = []
+    yahoo_details = YahooFinanceProvider(ticker_factory=lambda symbol: details_requested.append(symbol) or DetailsTicker())
+    details = asyncio.run(yahoo_details.details("TCS:NSE"))
+    assert details["exchange"] == "NSE"
+    assert details_requested == ["TCS.NS"]
+
+
+def test_successful_primary_does_not_call_yahoo_fallback():
+    class Primary(MarketDataProvider):
+        async def search(self, query: str): return []
+        async def quote(self, symbol: str): return Decimal("123")
+        async def details(self, symbol: str): return {}
+        async def history(self, symbol: str): return []
+
+    fallback = YahooFinanceProvider(ticker_factory=lambda symbol: (_ for _ in ()).throw(AssertionError("fallback called")))
+    service = MarketDataService(Primary(), fallback)
+    assert asyncio.run(service._primary_or_fallback("quote", "AAPL")) == Decimal("123")
+
+
+def test_symbol_normalizer_keeps_exchange_aliases_provider_specific():
+    assert SymbolNormalizer.twelve("TCS", "NSE") == "TCS:NSE"
+    assert SymbolNormalizer.yahoo("TCS", "NSE") == "TCS.NS"
+    assert SymbolNormalizer.yahoo("500325", "BSE") == "500325.BO"
+    assert SymbolNormalizer.yahoo("AAPL", "NASDAQ") == "AAPL"

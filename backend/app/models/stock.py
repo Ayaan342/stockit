@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, Numeric, String, func
+from sqlalchemy import DateTime, Numeric, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -9,11 +9,14 @@ from app.database import Base
 
 class Stock(Base):
     __tablename__ = "stocks"
+    __table_args__ = (UniqueConstraint("symbol", "exchange", name="uq_stocks_symbol_exchange"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    symbol: Mapped[str] = mapped_column(String(20), unique=True, index=True)
+    # A ticker is only meaningful with its selected listing (for example TCS
+    # on NSE is not the same instrument as TCS on BSE).
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    exchange: Mapped[str | None] = mapped_column(String(64))
+    exchange: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
     last_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 6))
     last_price_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

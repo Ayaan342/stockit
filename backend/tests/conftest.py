@@ -23,7 +23,7 @@ from app.services.market_data import MarketDataProvider
 
 class FakeMarketProvider(MarketDataProvider):
     def __init__(self) -> None:
-        self.prices = {"AAPL": Decimal("100.00"), "MSFT": Decimal("200.00")}
+        self.prices = {"AAPL": Decimal("100.00"), "MSFT": Decimal("200.00"), "TCS:NSE": Decimal("3500.00")}
         self.quote_calls = 0
 
     async def search(self, query: str) -> list[dict]:
@@ -41,7 +41,8 @@ class FakeMarketProvider(MarketDataProvider):
         normalized = symbol.upper()
         if normalized not in self.prices:
             raise KeyError(normalized)
-        return {"symbol": normalized, "name": f"{normalized} Inc.", "exchange": "NASDAQ"}
+        base, _, exchange = normalized.partition(":")
+        return {"symbol": base, "name": f"{base} Inc.", "exchange": exchange or "NASDAQ", "currency": "INR" if exchange in {"NSE", "BSE"} else "USD"}
 
     async def history(self, symbol: str) -> list[StockHistoryPoint]:
         price = await self.quote(symbol)

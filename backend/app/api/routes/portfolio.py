@@ -11,6 +11,7 @@ from app.models.portfolio import Holding, Portfolio, Transaction
 from app.models.user import User
 from app.schemas.portfolio import (
     HoldingResponse,
+    PortfolioCurrencyGroup,
     PortfolioPerformancePoint,
     PortfolioResponse,
     TradeRequest,
@@ -39,10 +40,22 @@ async def valued_holdings(db: Session, portfolio: Portfolio, market: MarketDataS
     responses: list[HoldingResponse] = []
     for holding in holdings:
         try:
-            stock = await market.get_stock(db, holding.stock.symbol, require_price=True)
-        except MarketDataError as exc:
-            raise provider_error(exc) from exc
-        responses.append(holding_response(holding, stock.last_price))
+            stock = await market.get_stock(db, holding.stock.symbol, exchange=holding.stock.exchange, require_price=True)
+            responses.append(holding_response(holding, stock.last_price))
+        except MarketDataError:
+            # A position is recorded accounting data. Market valuation is
+            # optional enrichment and must never hide a valid holding.
+            responses.append(holding_response(holding, None))
+    currency_totals: dict[str, Decimal] = {}
+    for item in responses:
+        if item.current_value is not None:
+            currency_totals[item.currency] = currency_totals.get(item.currency, Decimal("0")) + item.current_value
+    incomplete_currencies = {
+        item.currency for item in responses if item.current_value is None
+    }
+    for item in responses:
+        total = currency_totals.get(item.currency, Decimal("0"))
+        item.allocation_percentage = None if item.currency in incomplete_currencies or total == 0 or item.current_value is None else (item.current_value / total * Decimal("100")).quantize(Decimal("0.01"))
     return responses
 
 
@@ -50,6 +63,8 @@ def transaction_response(transaction: Transaction) -> TransactionResponse:
     return TransactionResponse(
         id=transaction.id,
         symbol=transaction.stock.symbol,
+        exchange=transaction.stock.exchange,
+        currency=transaction.stock.currency,
         transaction_type=transaction.transaction_type,
         quantity=transaction.quantity,
         price=transaction.price,
@@ -72,24 +87,47 @@ async def portfolio_summary(
             select(Transaction).where(Transaction.portfolio_id == portfolio.id).order_by(Transaction.created_at, Transaction.id)
         )
     )
-    total_invested = money(sum((item.invested_value for item in holdings), Decimal("0")))
-    current_holdings_value = money(sum((item.current_value for item in holdings), Decimal("0")))
-    total_value = current_holdings_value
-    unrealized = money(sum((item.profit_loss for item in holdings), Decimal("0")))
-    realized = realized_profit_loss(transactions)
-    profit_loss = money(realized + unrealized)
-    percentage = None if total_invested == 0 else (profit_loss / total_invested * Decimal("100")).quantize(Decimal("0.01"))
-    return PortfolioResponse(
-        portfolio_id=portfolio.id,
-        total_invested=total_invested,
-        current_holdings_value=current_holdings_value,
-        realized_profit_loss=realized,
-        unrealized_profit_loss=unrealized,
-        total_portfolio_value=total_value,
-        total_profit_loss=profit_loss,
-        profit_loss_percentage=percentage,
-        day_change=None,
-    )
+    currencies = {item.currency for item in holdings} | {transaction.stock.currency for transaction in transactions}
+    groups: list[PortfolioCurrencyGroup] = []
+    for currency in sorted(currencies):
+        group_holdings = [item for item in holdings if item.currency == currency]
+        group_transactions = [item for item in transactions if item.stock.currency == currency]
+        invested = money(sum((item.invested_value for item in group_holdings), Decimal("0")))
+        realized = realized_profit_loss(group_transactions)
+        valuation_complete = all(
+            item.current_value is not None and item.profit_loss is not None
+            for item in group_holdings
+        )
+        value = money(sum((item.current_value for item in group_holdings), Decimal("0"))) if valuation_complete else None
+        unrealized = money(sum((item.profit_loss for item in group_holdings), Decimal("0"))) if valuation_complete else None
+        total_profit_loss = money(realized + unrealized) if unrealized is not None else None
+        percentage = None if invested == 0 or total_profit_loss is None else (total_profit_loss / invested * Decimal("100")).quantize(Decimal("0.01"))
+        groups.append(PortfolioCurrencyGroup(
+            currency=currency,
+            market_group="INDIA" if currency == "INR" else "US" if currency == "USD" else currency,
+            total_invested=invested, current_holdings_value=value, realized_profit_loss=realized,
+            unrealized_profit_loss=unrealized, total_portfolio_value=value,
+            total_profit_loss=total_profit_loss, profit_loss_percentage=percentage,
+            number_of_assets=len(group_holdings),
+        ))
+    response = PortfolioResponse(portfolio_id=portfolio.id, groups=groups, day_change=None)
+    if not groups:
+        response.total_invested = Decimal("0.00")
+        response.current_holdings_value = Decimal("0.00")
+        response.realized_profit_loss = Decimal("0.00")
+        response.unrealized_profit_loss = Decimal("0.00")
+        response.total_portfolio_value = Decimal("0.00")
+        response.total_profit_loss = Decimal("0.00")
+    if len(groups) == 1:
+        group = groups[0]
+        response.total_invested = group.total_invested
+        response.current_holdings_value = group.current_holdings_value
+        response.realized_profit_loss = group.realized_profit_loss
+        response.unrealized_profit_loss = group.unrealized_profit_loss
+        response.total_portfolio_value = group.total_portfolio_value
+        response.total_profit_loss = group.total_profit_loss
+        response.profit_loss_percentage = group.profit_loss_percentage
+    return response
 
 
 @router.get("/holdings", response_model=list[HoldingResponse])
@@ -113,7 +151,8 @@ async def performance(
 ) -> list[PortfolioPerformancePoint]:
     """Returns the current valuation until historical portfolio snapshots are introduced."""
     summary = await portfolio_summary(current_user, db, market)
-    return [PortfolioPerformancePoint(timestamp=datetime.now(timezone.utc), portfolio_value=summary.total_portfolio_value)]
+    # Performance snapshots are not yet stored. Do not merge currency values.
+    return []
 
 
 @router.post("/buy", response_model=TransactionResponse, status_code=status.HTTP_201_CREATED)
@@ -121,7 +160,7 @@ async def buy(
     payload: TradeRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db), market: MarketDataService = Depends(get_market_service)
 ) -> TransactionResponse:
     try:
-        stock = await market.get_stock(db, normalize_symbol(payload.symbol))
+        stock = await market.resolve_stock(db, payload.symbol, exchange=payload.exchange)
     except MarketDataError as exc:
         raise provider_error(exc) from exc
     try:
@@ -160,7 +199,7 @@ async def sell(
     payload: TradeRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db), market: MarketDataService = Depends(get_market_service)
 ) -> TransactionResponse:
     try:
-        stock = await market.get_stock(db, normalize_symbol(payload.symbol))
+        stock = await market.resolve_stock(db, payload.symbol, exchange=payload.exchange)
     except MarketDataError as exc:
         raise provider_error(exc) from exc
     try:
@@ -171,7 +210,7 @@ async def sell(
         if holding is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No holding exists for this stock")
         if payload.quantity > holding.quantity:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Sell quantity exceeds owned shares")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Insufficient quantity. You currently own {holding.quantity} shares.")
         total = money(payload.quantity * payload.price - payload.fees)
         if total < 0:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Fees cannot exceed sale proceeds")

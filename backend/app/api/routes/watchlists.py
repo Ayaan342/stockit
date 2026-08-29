@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
@@ -66,11 +66,11 @@ def delete_watchlist(watchlist_id: int, current_user: User = Depends(get_current
 
 @router.post("/{watchlist_id}/stocks/{symbol}", response_model=WatchlistResponse, status_code=status.HTTP_201_CREATED)
 async def add_stock(
-    watchlist_id: int, symbol: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db), market: MarketDataService = Depends(get_market_service)
+    watchlist_id: int, symbol: str, exchange: str | None = Query(default=None, min_length=1, max_length=64), current_user: User = Depends(get_current_user), db: Session = Depends(get_db), market: MarketDataService = Depends(get_market_service)
 ) -> WatchlistResponse:
     watchlist = owned_watchlist(db, current_user.id, watchlist_id)
     try:
-        stock = await market.get_stock(db, normalize_symbol(symbol))
+        stock = await market.get_stock(db, symbol, exchange=exchange)
     except MarketDataError as exc:
         raise provider_error(exc) from exc
     if any(entry.stock_id == stock.id for entry in watchlist.stocks):
@@ -85,9 +85,9 @@ async def add_stock(
 
 
 @router.delete("/{watchlist_id}/stocks/{symbol}", status_code=status.HTTP_204_NO_CONTENT)
-def remove_stock(watchlist_id: int, symbol: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> Response:
+def remove_stock(watchlist_id: int, symbol: str, exchange: str | None = Query(default=None, min_length=1, max_length=64), current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> Response:
     watchlist = owned_watchlist(db, current_user.id, watchlist_id)
-    entry = next((entry for entry in watchlist.stocks if entry.stock.symbol == normalize_symbol(symbol)), None)
+    entry = next((entry for entry in watchlist.stocks if entry.stock.symbol == normalize_symbol(symbol) and (exchange is None or entry.stock.exchange == exchange.upper())), None)
     if entry is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stock is not in this watchlist")
     db.delete(entry)

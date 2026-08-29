@@ -44,7 +44,7 @@ def test_detail_and_history_use_the_selected_listing_exchange(client):
         detail = client.get(f"/api/v1/stocks/{symbol}", params={"exchange": exchange})
         history = client.get(f"/api/v1/stocks/{symbol}/history", params={"exchange": exchange})
         assert detail.status_code == history.status_code == 200
-        expected = symbol if ":" in symbol else f"{symbol}:{exchange}"
+        expected = symbol if ":" in symbol else (f"{symbol}:{exchange}" if exchange in {"NSE", "BSE"} else symbol)
         assert f"details:{expected}" in provider.calls
         assert f"history:{expected}" in provider.calls
 

@@ -1,6 +1,7 @@
 """Market-data provider boundary. Provider responses are never invented or synthesized."""
 
 from abc import ABC, abstractmethod
+import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -87,14 +88,15 @@ class TwelveDataProvider(MarketDataProvider):
         data = payload.get("data")
         if not isinstance(data, list):
             raise MarketDataError("Market data provider returned an invalid response")
-        normalized_query = normalize_symbol(query)
+        normalized_query, _ = SymbolNormalizer.split(query)
         seen: set[tuple[str, str, str]] = set()
         candidates: list[tuple[dict, dict, int]] = []
         for source_index, item in enumerate(data):
             if not isinstance(item, dict) or not item.get("symbol"):
                 continue
-            symbol = normalize_symbol(str(item["symbol"]))
-            exchange = str(item.get("exchange") or "").strip().upper()
+            raw_symbol = str(item["symbol"]).strip().upper()
+            symbol, qualified_exchange = SymbolNormalizer.split(str(item["symbol"]))
+            exchange = str(item.get("exchange") or qualified_exchange or "").strip().upper()
             currency = str(item.get("currency") or "").strip().upper()
             identity = (symbol, exchange, currency)
             if identity in seen:
@@ -102,7 +104,7 @@ class TwelveDataProvider(MarketDataProvider):
             seen.add(identity)
             candidates.append((
                 {
-                    "symbol": symbol,
+                    "symbol": raw_symbol,
                     "name": item.get("instrument_name") or item.get("name") or item["symbol"],
                     "exchange": exchange or None,
                     "currency": currency or "USD",
@@ -113,7 +115,7 @@ class TwelveDataProvider(MarketDataProvider):
 
         def rank(candidate: tuple[dict, dict, int]) -> tuple[int, int, int, int]:
             result, metadata, source_index = candidate
-            symbol = result["symbol"]
+            symbol = SymbolNormalizer.split(result["symbol"])[0]
             instrument_type = str(metadata.get("type") or metadata.get("instrument_type") or "").lower()
             exact_match = 0 if symbol == normalized_query else 1
             if any(marker in instrument_type for marker in self._STRUCTURED_TYPE_MARKERS):
@@ -177,71 +179,147 @@ class TwelveDataProvider(MarketDataProvider):
             raise MarketDataError("Market data provider returned an invalid history response") from exc
 
 
+class SymbolNormalizer:
+    """Centralizes canonical listing identities and provider-specific symbols."""
+
+    @staticmethod
+    def split(symbol: str) -> tuple[str, str | None]:
+        normalized = symbol.strip().upper()
+        base, separator, exchange = normalized.partition(":")
+        return base, exchange if separator and exchange else None
+
+    @classmethod
+    def listing(cls, symbol: str, exchange: str | None = None) -> tuple[str, str]:
+        base, embedded_exchange = cls.split(symbol)
+        return base, (exchange or embedded_exchange or "").strip().upper()
+
+    @classmethod
+    def twelve(cls, symbol: str, exchange: str | None = None) -> str:
+        base, selected_exchange = cls.listing(symbol, exchange)
+        return f"{base}:{selected_exchange}" if selected_exchange in {"NSE", "BSE"} else base
+
+    @classmethod
+    def yahoo(cls, symbol: str, exchange: str | None = None) -> str:
+        base, selected_exchange = cls.listing(symbol, exchange)
+        if selected_exchange == "NSE":
+            return f"{base}.NS"
+        if selected_exchange == "BSE":
+            return f"{base}.BO"
+        return base
+
+
 def normalize_symbol(symbol: str) -> str:
-    return symbol.strip().upper()
+    return SymbolNormalizer.split(symbol)[0]
 
 
 def provider_symbol(symbol: str, exchange: str | None = None) -> str:
-    """Return the selected Twelve Data listing identifier without guessing an exchange."""
-    normalized_symbol = normalize_symbol(symbol)
-    if ":" in normalized_symbol or not exchange:
-        return normalized_symbol
-    return f"{normalized_symbol}:{exchange.strip().upper()}"
+    return SymbolNormalizer.twelve(symbol, exchange)
+
+
+class YahooFinanceProvider(MarketDataProvider):
+    """Server-side yfinance fallback. It is only called after Twelve Data fails."""
+
+    def __init__(self, ticker_factory=None) -> None:
+        self._ticker_factory = ticker_factory
+
+    def _ticker(self, symbol: str):
+        if self._ticker_factory is not None:
+            return self._ticker_factory(symbol)
+        try:
+            import yfinance
+        except ImportError as exc:  # Keeps startup explicit if requirements were not installed.
+            raise MarketDataError("Market data provider is currently unavailable") from exc
+        return yfinance.Ticker(symbol)
+
+    async def search(self, query: str) -> list[dict]:
+        # Search remains Twelve-only to avoid broad, costly fallback queries.
+        raise MarketDataError("Stock data was not found", status_code=404)
+
+    async def details(self, symbol: str) -> dict:
+        base, exchange = SymbolNormalizer.listing(symbol)
+        ticker = self._ticker(SymbolNormalizer.yahoo(base, exchange))
+        try:
+            info = await asyncio.to_thread(lambda: ticker.info)
+        except Exception as exc:
+            raise MarketDataError("Market data provider is currently unavailable") from exc
+        if not isinstance(info, dict) or not info:
+            raise MarketDataError("Stock data was not found", status_code=404)
+        return {
+            "symbol": base,
+            "name": info.get("longName") or info.get("shortName") or base,
+            "exchange": exchange or info.get("exchange") or "",
+            "currency": info.get("currency") or ("INR" if exchange in {"NSE", "BSE"} else "USD"),
+        }
+
+    async def quote(self, symbol: str) -> Decimal:
+        ticker = self._ticker(SymbolNormalizer.yahoo(symbol))
+        try:
+            fast_info = await asyncio.to_thread(lambda: ticker.fast_info)
+            raw_price = fast_info.get("last_price") if fast_info else None
+            price = Decimal(str(raw_price))
+        except (Exception, InvalidOperation, TypeError) as exc:
+            raise MarketDataError("Market data provider is currently unavailable") from exc
+        if price <= 0:
+            raise MarketDataError("No current market price is available", status_code=404)
+        return price
+
+    async def history(self, symbol: str) -> list[StockHistoryPoint]:
+        ticker = self._ticker(SymbolNormalizer.yahoo(symbol))
+        try:
+            frame = await asyncio.to_thread(lambda: ticker.history(period="1mo", interval="1d", auto_adjust=False))
+            if frame is None or frame.empty:
+                raise ValueError("empty history")
+            return [
+                StockHistoryPoint(timestamp=index.to_pydatetime().astimezone(timezone.utc), close=Decimal(str(row["Close"])))
+                for index, row in frame.iterrows()
+                if Decimal(str(row["Close"])) > 0
+            ]
+        except MarketDataError:
+            raise
+        except Exception as exc:
+            raise MarketDataError("Market data provider is currently unavailable") from exc
 
 
 class MarketDataService:
-    def __init__(self, provider: MarketDataProvider) -> None:
+    def __init__(self, provider: MarketDataProvider, fallback_provider: MarketDataProvider | None = None) -> None:
         self.provider = provider
+        self.fallback_provider = fallback_provider
+        self._history_cache: dict[tuple[str, str], tuple[datetime, list[StockHistoryPoint]]] = {}
 
     async def search(self, db: Session, query: str) -> list[Stock]:
         results = await self.provider.search(query)
-        # The cache table intentionally has one row per symbol, while provider
-        # search can return several exchange/currency listings for that symbol.
-        # Return distinct transient result objects; only cache the best-ranked
-        # listing for each symbol so one ORM row cannot overwrite every result.
         stocks: list[Stock] = []
         seen_listings: set[tuple[str, str, str]] = set()
-        cached_symbols: set[str] = set()
         for result in results:
-            symbol = normalize_symbol(result["symbol"])
-            exchange = str(result.get("exchange") or "").strip().upper()
+            symbol, exchange = SymbolNormalizer.listing(result["symbol"], result.get("exchange"))
             currency = str(result.get("currency") or "").strip().upper()
             listing_identity = (symbol, exchange, currency)
             if listing_identity in seen_listings:
                 continue
             seen_listings.add(listing_identity)
-            if symbol not in cached_symbols:
-                self._upsert_stock(db, result)
-                cached_symbols.add(symbol)
-            stocks.append(
-                Stock(
-                    symbol=symbol,
-                    name=result.get("name") or symbol,
-                    exchange=exchange or None,
-                    currency=currency or "USD",
-                )
-            )
+            self._upsert_stock(db, {**result, "symbol": symbol, "exchange": exchange, "currency": currency or "USD"})
+            # Return the provider-facing selected listing, including `:NSE`
+            # where present, while persisting the canonical pair separately.
+            stocks.append(Stock(symbol=normalize_symbol(result["symbol"]), name=result.get("name") or symbol, exchange=exchange, currency=currency or "USD"))
         db.commit()
         return stocks
 
     def _upsert_stock(self, db: Session, data: dict) -> Stock:
-        symbol = normalize_symbol(data["symbol"])
-        stock = db.scalar(select(Stock).where(Stock.symbol == symbol))
+        symbol, exchange = SymbolNormalizer.listing(data["symbol"], data.get("exchange"))
+        stock = db.scalar(select(Stock).where(Stock.symbol == symbol, Stock.exchange == exchange))
         if stock is None:
-            # The unique symbol constraint remains the source of truth. A
-            # savepoint turns a concurrent insert into a safe fetch of its row.
             try:
                 with db.begin_nested():
                     stock = Stock(
                         symbol=symbol,
                         name=data.get("name") or symbol,
-                        exchange=data.get("exchange"),
+                        exchange=exchange,
                         currency=data.get("currency") or "USD",
                     )
                     db.add(stock)
                     db.flush()
             except IntegrityError:
-                stock = db.scalar(select(Stock).where(Stock.symbol == symbol))
+                stock = db.scalar(select(Stock).where(Stock.symbol == symbol, Stock.exchange == exchange))
                 if stock is None:
                     raise
         else:
@@ -249,6 +327,19 @@ class MarketDataService:
             stock.exchange = data.get("exchange") or stock.exchange
             stock.currency = data.get("currency") or stock.currency
         return stock
+
+    async def _primary_or_fallback(self, operation: str, symbol: str):
+        try:
+            return await getattr(self.provider, operation)(symbol)
+        except MarketDataError as primary_error:
+            # A Twelve Data 429 is explicit and should reach the caller; a
+            # fallback retry would hide the rate-limit state and waste calls.
+            if primary_error.status_code == 429 or self.fallback_provider is None:
+                raise
+            try:
+                return await getattr(self.fallback_provider, operation)(symbol)
+            except MarketDataError:
+                raise primary_error
 
     @staticmethod
     def _as_utc(value: datetime) -> datetime:
@@ -259,29 +350,43 @@ class MarketDataService:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
 
-    async def get_stock(self, db: Session, symbol: str, *, exchange: str | None = None, require_price: bool = False) -> Stock:
-        symbol = normalize_symbol(symbol)
+    async def resolve_stock(self, db: Session, symbol: str, *, exchange: str | None = None) -> Stock:
+        """Resolve and persist an instrument listing without obtaining a quote.
+
+        This is used by the transaction ledger: recorded prices are supplied by
+        the user and do not depend on a live valuation endpoint being healthy.
+        """
+        symbol, exchange = SymbolNormalizer.listing(symbol, exchange)
         selected_provider_symbol = provider_symbol(symbol, exchange)
-        stock = db.scalar(select(Stock).where(Stock.symbol == symbol))
+        stock = db.scalar(select(Stock).where(Stock.symbol == symbol, Stock.exchange == exchange))
+        if stock is None and not exchange:
+            # Unqualified requests retain the already-resolved primary listing
+            # rather than creating a duplicate blank-exchange cache row.
+            stock = db.scalar(select(Stock).where(Stock.symbol == symbol).order_by(Stock.id))
+            if stock is not None:
+                exchange = stock.exchange
+                selected_provider_symbol = provider_symbol(symbol, exchange)
+        if stock is None:
+            details = await self._primary_or_fallback("details", selected_provider_symbol)
+            details["symbol"], details["exchange"] = SymbolNormalizer.listing(
+                details.get("symbol", symbol), details.get("exchange") or exchange
+            )
+            stock = self._upsert_stock(db, details)
+            db.commit()
+            db.refresh(stock)
+        return stock
+
+    async def get_stock(self, db: Session, symbol: str, *, exchange: str | None = None, require_price: bool = False) -> Stock:
+        stock = await self.resolve_stock(db, symbol, exchange=exchange)
         stale = stock is None or stock.last_price_updated_at is None or (
             datetime.now(timezone.utc) - self._as_utc(stock.last_price_updated_at)
         ).total_seconds() > settings.market_cache_seconds
-        # A cached row represents the bare stock symbol. Refresh when the user
-        # explicitly selected another exchange so Twelve Data resolves that
-        # exact listing rather than an arbitrary symbol match.
-        if exchange:
-            # The cache is keyed by bare symbol, so it cannot prove that its
-            # value belongs to a user-selected listing. Always resolve an
-            # explicit exchange with Twelve Data before returning details.
-            stale = True
         if stale:
-            details = await self.provider.details(selected_provider_symbol)
-            stock = self._upsert_stock(db, details)
             try:
-                stock.last_price = await self.provider.quote(selected_provider_symbol)
+                stock.last_price = await self._primary_or_fallback("quote", provider_symbol(stock.symbol, stock.exchange))
                 stock.last_price_updated_at = datetime.now(timezone.utc)
             except MarketDataError:
-                if require_price or stock.last_price is None:
+                if require_price:
                     raise
             db.commit()
             db.refresh(stock)
@@ -290,4 +395,11 @@ class MarketDataService:
         return stock
 
     async def history(self, symbol: str, *, exchange: str | None = None) -> list[StockHistoryPoint]:
-        return await self.provider.history(provider_symbol(symbol, exchange))
+        base, selected_exchange = SymbolNormalizer.listing(symbol, exchange)
+        key = (base, selected_exchange)
+        cached = self._history_cache.get(key)
+        if cached and (datetime.now(timezone.utc) - cached[0]).total_seconds() <= settings.market_cache_seconds:
+            return cached[1]
+        points = await self._primary_or_fallback("history", provider_symbol(base, selected_exchange))
+        self._history_cache[key] = (datetime.now(timezone.utc), points)
+        return points

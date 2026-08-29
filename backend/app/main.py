@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
-from app.services.market_data import MarketDataService, TwelveDataProvider
+from app.services.market_data import MarketDataService, TwelveDataProvider, YahooFinanceProvider
 
 app = FastAPI(title="StockIt API", version="1.0.0")
 app.add_middleware(
@@ -12,7 +12,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.state.market_service = MarketDataService(TwelveDataProvider())
+app.state.market_service = MarketDataService(TwelveDataProvider(), YahooFinanceProvider())
 app.include_router(api_router)
 
 

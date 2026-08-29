@@ -10,8 +10,15 @@ def money(value: Decimal) -> Decimal:
     return value.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
 
 
-def holding_response(holding: Holding, current_price: Decimal) -> HoldingResponse:
+def holding_response(holding: Holding, current_price: Decimal | None, allocation_percentage: Decimal | None = None) -> HoldingResponse:
     invested_value = money(holding.quantity * holding.average_buy_price)
+    if current_price is None:
+        return HoldingResponse(
+            symbol=holding.stock.symbol, name=holding.stock.name, exchange=holding.stock.exchange,
+            currency=holding.stock.currency, quantity=holding.quantity, average_buy_price=holding.average_buy_price,
+            current_market_price=None, invested_value=invested_value, current_value=None, profit_loss=None,
+            profit_loss_percentage=None, allocation_percentage=None,
+        )
     current_value = money(holding.quantity * current_price)
     profit_loss = money(current_value - invested_value)
     percentage = None
@@ -22,6 +29,8 @@ def holding_response(holding: Holding, current_price: Decimal) -> HoldingRespons
     return HoldingResponse(
         symbol=holding.stock.symbol,
         name=holding.stock.name,
+        exchange=holding.stock.exchange,
+        currency=holding.stock.currency,
         quantity=holding.quantity,
         average_buy_price=holding.average_buy_price,
         current_market_price=current_price,
@@ -29,6 +38,7 @@ def holding_response(holding: Holding, current_price: Decimal) -> HoldingRespons
         current_value=current_value,
         profit_loss=profit_loss,
         profit_loss_percentage=percentage,
+        allocation_percentage=allocation_percentage,
     )
 
 
