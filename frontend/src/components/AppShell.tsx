@@ -2,7 +2,7 @@ import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/useAuth'
 
 const links = [
-  ['/portfolio', 'Portfolio', 'briefcase'], ['/trade', 'Buy / Sell', 'swap'], ['/watchlists', 'Watchlist', 'bookmark'], ['/stocks', 'Stocks', 'search'], ['/transactions', 'Transactions', 'activity'], ['/analytics', 'Analytics', 'chart'],
+  ['/overview', 'Portfolio', 'home'], ['/holdings', 'Holdings', 'briefcase'], ['/trade?side=buy', 'Buy / Sell', 'swap'], ['/analytics', 'Analytics', 'chart'], ['/watchlists', 'Watchlist', 'bookmark'], ['/transactions', 'Transactions', 'activity'],
 ] as const
 
 function NavIcon({ name }: { name: string }) {
@@ -28,6 +28,6 @@ export function AppShell() {
       <nav className="side-nav" aria-label="Main navigation">{links.map(([to, label, icon]) => <NavLink key={to} to={to}><NavIcon name={icon} /><span>{label}</span></NavLink>)}</nav>
       <div className="sidebar-footer"><div className="avatar">{(user?.name || user?.email || 'U').charAt(0).toUpperCase()}</div><div><strong>{user?.name || 'Investor'}</strong><small>{user?.email}</small></div><button className="logout" onClick={signOut} aria-label="Log out">↗</button></div>
     </aside>
-    <div className="content-shell"><header className="mobile-header"><NavLink className="brand" to="/portfolio"><span className="brand-mark">S</span> StockIt</NavLink><button className="logout" onClick={signOut}>Log out</button></header><main className="page"><Outlet /></main></div>
+    <div className="content-shell"><header className="topbar"><span className="topbar-context">Portfolio tracker</span><div><span className="topbar-user">{user?.name || user?.email || 'Investor'}</span><button className="logout" onClick={signOut}>Log out</button></div></header><header className="mobile-header"><NavLink className="brand" to="/overview"><span className="brand-mark">S</span> StockIt</NavLink><button className="logout" onClick={signOut}>Log out</button></header><nav className="mobile-nav" aria-label="Mobile navigation">{links.map(([to, label]) => <NavLink key={to} to={to}>{label}</NavLink>)}</nav><main className="page"><Outlet /></main></div>
   </div>
 }

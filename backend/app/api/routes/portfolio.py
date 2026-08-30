@@ -1,7 +1,12 @@
+import asyncio
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
+from time import perf_counter
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
@@ -12,6 +17,7 @@ from app.models.user import User
 from app.schemas.portfolio import (
     HoldingResponse,
     PortfolioCurrencyGroup,
+    PortfolioHistoryResponse,
     PortfolioPerformancePoint,
     PortfolioResponse,
     TradeRequest,
@@ -19,8 +25,10 @@ from app.schemas.portfolio import (
 )
 from app.services.market_data import MarketDataError, MarketDataService, normalize_symbol
 from app.services.portfolio import holding_response, money, realized_profit_loss
+from app.services.portfolio_history import portfolio_history
 
 router = APIRouter(prefix="/portfolio", tags=["portfolio"])
+logger = logging.getLogger("uvicorn.error")
 
 
 def get_portfolio(db: Session, user_id: int, *, lock: bool = False) -> Portfolio:
@@ -34,18 +42,29 @@ def get_portfolio(db: Session, user_id: int, *, lock: bool = False) -> Portfolio
 
 
 async def valued_holdings(db: Session, portfolio: Portfolio, market: MarketDataService) -> list[HoldingResponse]:
+    started = perf_counter()
+    db_started = perf_counter()
     holdings = db.scalars(
         select(Holding).options(joinedload(Holding.stock)).where(Holding.portfolio_id == portfolio.id).order_by(Holding.id)
+    ).all()
+    logger.info("portfolio_timing stage=holdings_db portfolio_id=%s elapsed_ms=%.1f", portfolio.id, (perf_counter() - db_started) * 1000)
+    quote_started = perf_counter()
+    quote_results = await asyncio.gather(
+        *(market.quote_for_stock(holding.stock) for holding in holdings), return_exceptions=True
     )
+    logger.info("portfolio_timing stage=holdings_quotes portfolio_id=%s holdings=%s elapsed_ms=%.1f", portfolio.id, len(holdings), (perf_counter() - quote_started) * 1000)
     responses: list[HoldingResponse] = []
-    for holding in holdings:
-        try:
-            stock = await market.get_stock(db, holding.stock.symbol, exchange=holding.stock.exchange, require_price=True)
-            responses.append(holding_response(holding, stock.last_price))
-        except MarketDataError:
+    for holding, quote in zip(holdings, quote_results, strict=True):
+        if isinstance(quote, Exception):
             # A position is recorded accounting data. Market valuation is
             # optional enrichment and must never hide a valid holding.
             responses.append(holding_response(holding, None))
+        else:
+            holding.stock.last_price = quote
+            holding.stock.last_price_updated_at = datetime.now(timezone.utc)
+            responses.append(holding_response(holding, quote))
+    if holdings:
+        db.commit()
     currency_totals: dict[str, Decimal] = {}
     for item in responses:
         if item.current_value is not None:
@@ -56,6 +75,7 @@ async def valued_holdings(db: Session, portfolio: Portfolio, market: MarketDataS
     for item in responses:
         total = currency_totals.get(item.currency, Decimal("0"))
         item.allocation_percentage = None if item.currency in incomplete_currencies or total == 0 or item.current_value is None else (item.current_value / total * Decimal("100")).quantize(Decimal("0.01"))
+    logger.info("portfolio_timing stage=holdings_total portfolio_id=%s elapsed_ms=%.1f", portfolio.id, (perf_counter() - started) * 1000)
     return responses
 
 
@@ -139,10 +159,13 @@ async def list_holdings(
 
 @router.get("/transactions", response_model=list[TransactionResponse])
 def list_transactions(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[TransactionResponse]:
+    started = perf_counter()
     transactions = db.scalars(
         select(Transaction).options(joinedload(Transaction.stock)).where(Transaction.user_id == current_user.id).order_by(Transaction.created_at.desc(), Transaction.id.desc())
     )
-    return [transaction_response(transaction) for transaction in transactions]
+    response = [transaction_response(transaction) for transaction in transactions]
+    logger.info("portfolio_timing stage=transactions_db user_id=%s rows=%s elapsed_ms=%.1f", current_user.id, len(response), (perf_counter() - started) * 1000)
+    return response
 
 
 @router.get("/performance", response_model=list[PortfolioPerformancePoint])
@@ -153,6 +176,21 @@ async def performance(
     summary = await portfolio_summary(current_user, db, market)
     # Performance snapshots are not yet stored. Do not merge currency values.
     return []
+
+
+@router.get("/history", response_model=PortfolioHistoryResponse)
+async def portfolio_value_history(
+    currency: str = Query(min_length=3, max_length=3),
+    period: Literal["30d", "1y"] = Query(default="30d"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    market: MarketDataService = Depends(get_market_service),
+) -> PortfolioHistoryResponse:
+    selected_currency = currency.upper()
+    try:
+        return await portfolio_history(db, get_portfolio(db, current_user.id), market, currency=selected_currency, period=period)
+    except MarketDataError as exc:
+        raise provider_error(exc) from exc
 
 
 @router.post("/buy", response_model=TransactionResponse, status_code=status.HTTP_201_CREATED)

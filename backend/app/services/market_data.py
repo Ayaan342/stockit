@@ -2,6 +2,8 @@
 
 from abc import ABC, abstractmethod
 import asyncio
+import logging
+from time import perf_counter
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -14,6 +16,8 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.stock import Stock
 from app.schemas.stock import StockHistoryPoint
+
+logger = logging.getLogger("uvicorn.error")
 
 
 class MarketDataError(Exception):
@@ -56,7 +60,8 @@ class TwelveDataProvider(MarketDataProvider):
 
     async def _get(self, path: str, params: dict[str, str]) -> dict:
         try:
-            async with httpx.AsyncClient(timeout=10.0, transport=self._transport) as client:
+            timeout = httpx.Timeout(settings.market_data_timeout_seconds, connect=min(settings.market_data_timeout_seconds, 2.0))
+            async with httpx.AsyncClient(timeout=timeout, transport=self._transport) as client:
                 response = await client.get(f"{self._base_url}{path}", params=params, headers=self._headers())
         except httpx.TimeoutException as exc:
             raise MarketDataError("Market data provider timed out") from exc
@@ -157,8 +162,8 @@ class TwelveDataProvider(MarketDataProvider):
         self._pending_quotes[symbol] = payload
         return {"symbol": str(payload["symbol"]).upper(), "name": payload.get("name") or payload["symbol"], "exchange": payload.get("exchange"), "currency": payload.get("currency")}
 
-    async def history(self, symbol: str) -> list[StockHistoryPoint]:
-        payload = await self._get("/time_series", {"symbol": symbol, "interval": "1day", "outputsize": "30", "order": "asc", "timezone": "UTC"})
+    async def history_for_days(self, symbol: str, days: int) -> list[StockHistoryPoint]:
+        payload = await self._get("/time_series", {"symbol": symbol, "interval": "1day", "outputsize": str(max(30, min(days, 5000))), "order": "asc", "timezone": "UTC"})
         values = payload.get("values")
         if not isinstance(values, list) or not values:
             raise MarketDataError("Stock price history was not found", status_code=404)
@@ -177,6 +182,9 @@ class TwelveDataProvider(MarketDataProvider):
             return points
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise MarketDataError("Market data provider returned an invalid history response") from exc
+
+    async def history(self, symbol: str) -> list[StockHistoryPoint]:
+        return await self.history_for_days(symbol, 30)
 
 
 class SymbolNormalizer:
@@ -253,20 +261,33 @@ class YahooFinanceProvider(MarketDataProvider):
 
     async def quote(self, symbol: str) -> Decimal:
         ticker = self._ticker(SymbolNormalizer.yahoo(symbol))
+        raw_price = None
         try:
             fast_info = await asyncio.to_thread(lambda: ticker.fast_info)
-            raw_price = fast_info.get("last_price") if fast_info else None
-            price = Decimal(str(raw_price))
-        except (Exception, InvalidOperation, TypeError) as exc:
-            raise MarketDataError("Market data provider is currently unavailable") from exc
+            raw_price = (fast_info.get("last_price") or fast_info.get("regular_market_price")) if fast_info else None
+            price = Decimal(str(raw_price)) if raw_price is not None else Decimal("0")
+        except (Exception, InvalidOperation, TypeError):
+            price = Decimal("0")
+        # yfinance fast_info can omit or lazily fail to load current fields for
+        # NSE/BSE listings. A latest valid Close is still real market data and
+        # is the correct valuation reference while that market is closed.
+        if price <= 0:
+            try:
+                frame = await asyncio.to_thread(lambda: ticker.history(period="5d", interval="1d", auto_adjust=False))
+                closes = frame["Close"].dropna() if frame is not None and not frame.empty else []
+                raw_price = closes.iloc[-1] if len(closes) else None
+                price = Decimal(str(raw_price)) if raw_price is not None else Decimal("0")
+            except (Exception, InvalidOperation, TypeError):
+                price = Decimal("0")
         if price <= 0:
             raise MarketDataError("No current market price is available", status_code=404)
         return price
 
-    async def history(self, symbol: str) -> list[StockHistoryPoint]:
+    async def history_for_days(self, symbol: str, days: int) -> list[StockHistoryPoint]:
         ticker = self._ticker(SymbolNormalizer.yahoo(symbol))
         try:
-            frame = await asyncio.to_thread(lambda: ticker.history(period="1mo", interval="1d", auto_adjust=False))
+            period = "1y" if days > 35 else "1mo"
+            frame = await asyncio.to_thread(lambda: ticker.history(period=period, interval="1d", auto_adjust=False))
             if frame is None or frame.empty:
                 raise ValueError("empty history")
             return [
@@ -279,12 +300,17 @@ class YahooFinanceProvider(MarketDataProvider):
         except Exception as exc:
             raise MarketDataError("Market data provider is currently unavailable") from exc
 
+    async def history(self, symbol: str) -> list[StockHistoryPoint]:
+        return await self.history_for_days(symbol, 30)
+
 
 class MarketDataService:
     def __init__(self, provider: MarketDataProvider, fallback_provider: MarketDataProvider | None = None) -> None:
         self.provider = provider
         self.fallback_provider = fallback_provider
-        self._history_cache: dict[tuple[str, str], tuple[datetime, list[StockHistoryPoint]]] = {}
+        self._history_cache: dict[tuple[str, str, int], tuple[datetime, list[StockHistoryPoint]]] = {}
+        self._quote_cache: dict[tuple[str, str], tuple[datetime, Decimal]] = {}
+        self._quote_tasks: dict[tuple[str, str], asyncio.Task[Decimal]] = {}
 
     async def search(self, db: Session, query: str) -> list[Stock]:
         results = await self.provider.search(query)
@@ -329,15 +355,21 @@ class MarketDataService:
         return stock
 
     async def _primary_or_fallback(self, operation: str, symbol: str):
+        started = perf_counter()
         try:
-            return await getattr(self.provider, operation)(symbol)
+            result = await getattr(self.provider, operation)(symbol)
+            logger.info("market_timing provider=twelve operation=%s symbol=%s elapsed_ms=%.1f", operation, symbol, (perf_counter() - started) * 1000)
+            return result
         except MarketDataError as primary_error:
             # A Twelve Data 429 is explicit and should reach the caller; a
             # fallback retry would hide the rate-limit state and waste calls.
             if primary_error.status_code == 429 or self.fallback_provider is None:
                 raise
             try:
-                return await getattr(self.fallback_provider, operation)(symbol)
+                fallback_started = perf_counter()
+                result = await getattr(self.fallback_provider, operation)(symbol)
+                logger.info("market_timing provider=yahoo operation=%s symbol=%s elapsed_ms=%.1f", operation, symbol, (perf_counter() - fallback_started) * 1000)
+                return result
             except MarketDataError:
                 raise primary_error
 
@@ -394,12 +426,55 @@ class MarketDataService:
             raise MarketDataError("No current market price is available")
         return stock
 
-    async def history(self, symbol: str, *, exchange: str | None = None) -> list[StockHistoryPoint]:
-        base, selected_exchange = SymbolNormalizer.listing(symbol, exchange)
-        key = (base, selected_exchange)
-        cached = self._history_cache.get(key)
-        if cached and (datetime.now(timezone.utc) - cached[0]).total_seconds() <= settings.market_cache_seconds:
+    async def quote_for_stock(self, stock: Stock) -> Decimal:
+        """Resolve one listing quote once across concurrent valuation requests."""
+        key = (stock.symbol, stock.exchange)
+        now = datetime.now(timezone.utc)
+        if stock.last_price is not None and stock.last_price_updated_at is not None and (
+            now - self._as_utc(stock.last_price_updated_at)
+        ).total_seconds() <= settings.market_cache_seconds:
+            logger.info("market_timing quote_cache=db symbol=%s exchange=%s", *key)
+            return stock.last_price
+        cached = self._quote_cache.get(key)
+        if cached and (now - cached[0]).total_seconds() <= settings.market_cache_seconds:
+            logger.info("market_timing quote_cache=memory symbol=%s exchange=%s", *key)
             return cached[1]
-        points = await self._primary_or_fallback("history", provider_symbol(base, selected_exchange))
-        self._history_cache[key] = (datetime.now(timezone.utc), points)
+        task = self._quote_tasks.get(key)
+        if task is None:
+            logger.info("market_timing quote_cache=miss symbol=%s exchange=%s", *key)
+            task = asyncio.create_task(self._primary_or_fallback("quote", provider_symbol(*key)))
+            self._quote_tasks[key] = task
+        try:
+            price = await asyncio.shield(task)
+            price = price.quantize(Decimal("0.000001"))
+            self._quote_cache[key] = (datetime.now(timezone.utc), price)
+            return price
+        finally:
+            if task.done():
+                self._quote_tasks.pop(key, None)
+
+    async def history(self, symbol: str, *, exchange: str | None = None) -> list[StockHistoryPoint]:
+        return await self.history_for_days(symbol, exchange=exchange, days=30)
+
+    async def history_for_days(self, symbol: str, *, exchange: str | None = None, days: int = 30) -> list[StockHistoryPoint]:
+        base, selected_exchange = SymbolNormalizer.listing(symbol, exchange)
+        now = datetime.now(timezone.utc)
+        for (cached_symbol, cached_exchange, cached_days), (cached_at, cached_points) in self._history_cache.items():
+            if (cached_symbol, cached_exchange) == (base, selected_exchange) and cached_days >= days and (now - cached_at).total_seconds() <= settings.market_history_cache_seconds:
+                return cached_points
+
+        async def fetch(provider: MarketDataProvider) -> list[StockHistoryPoint]:
+            method = getattr(provider, "history_for_days", None)
+            return await method(provider_symbol(base, selected_exchange), days) if method else await provider.history(provider_symbol(base, selected_exchange))
+
+        try:
+            points = await fetch(self.provider)
+        except MarketDataError as primary_error:
+            if primary_error.status_code == 429 or self.fallback_provider is None:
+                raise
+            try:
+                points = await fetch(self.fallback_provider)
+            except MarketDataError:
+                raise primary_error
+        self._history_cache[(base, selected_exchange, days)] = (now, points)
         return points

@@ -1,4 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+import logging
+from time import perf_counter
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
@@ -12,6 +15,7 @@ from app.schemas.watchlist import WatchlistCreate, WatchlistResponse
 from app.services.market_data import MarketDataError, MarketDataService, normalize_symbol
 
 router = APIRouter(prefix="/watchlists", tags=["watchlists"])
+logger = logging.getLogger("uvicorn.error")
 
 
 def serialize(watchlist: Watchlist) -> WatchlistResponse:
@@ -35,13 +39,18 @@ def owned_watchlist(db: Session, user_id: int, watchlist_id: int) -> Watchlist:
 
 
 @router.get("", response_model=list[WatchlistResponse])
-def list_watchlists(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[WatchlistResponse]:
+def list_watchlists(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[WatchlistResponse]:
+    started = perf_counter()
     watchlists = db.scalars(
         select(Watchlist).options(selectinload(Watchlist.stocks).selectinload(WatchlistStock.stock)).where(
             Watchlist.user_id == current_user.id
         ).order_by(Watchlist.created_at)
     )
-    return [serialize(watchlist) for watchlist in watchlists]
+    response = [serialize(watchlist) for watchlist in watchlists]
+    elapsed_ms = (perf_counter() - started) * 1000
+    logger.info("portfolio_timing stage=watchlists_db user_id=%s rows=%s elapsed_ms=%.1f", current_user.id, len(response), elapsed_ms)
+    request.state.timings["watchlists_db"] = elapsed_ms
+    return response
 
 
 @router.post("", response_model=WatchlistResponse, status_code=status.HTTP_201_CREATED)

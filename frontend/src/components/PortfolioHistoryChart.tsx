@@ -1,0 +1,11 @@
+import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import type { PortfolioHistory } from '../types/api'
+import { money } from '../utils/format'
+
+export function PortfolioHistoryChart({ history, monthly = false }: { history?: PortfolioHistory; monthly?: boolean }) {
+  if (!history) return <div className="chart-skeleton" aria-label="Loading portfolio history" />
+  const sampled = monthly ? history.points.filter((point, index, points) => index === points.length - 1 || point.date.slice(0, 7) !== points[index + 1]?.date.slice(0, 7)) : history.points
+  const data = sampled.filter((point) => point.value !== null).map((point) => ({ date: point.date, label: new Date(`${point.date}T00:00:00`).toLocaleDateString(undefined, monthly ? { month: 'short', year: 'numeric' } : { month: 'short', day: 'numeric' }), value: Number(point.value) }))
+  if (!data.length) return <p className="muted compact-empty">Historical market data is unavailable for this period.</p>
+  return <div className="portfolio-history-chart"><ResponsiveContainer width="100%" height={monthly ? 270 : 245}><AreaChart data={data} margin={{ top: 8, right: 8, left: 8, bottom: 0 }}><defs><linearGradient id={`history-fill-${history.period}`} x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stopColor="#23c8b2" stopOpacity={.22} /><stop offset="100%" stopColor="#23c8b2" stopOpacity={0} /></linearGradient></defs><CartesianGrid vertical={false} stroke="#25313b" strokeDasharray="3 5" /><XAxis dataKey="label" minTickGap={monthly ? 24 : 34} tickLine={false} axisLine={false} /><YAxis hide domain={['auto', 'auto']} /><Tooltip labelFormatter={(_, payload) => payload[0]?.payload.date ? new Date(`${payload[0].payload.date}T00:00:00`).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : ''} formatter={(value) => money(value as number, history.currency)} /><Area type="monotone" dataKey="value" stroke="#28c7b1" strokeWidth={2.2} fill={`url(#history-fill-${history.period})`} activeDot={{ r: 4, fill: '#e8fffb', stroke: '#28c7b1', strokeWidth: 2 }} /></AreaChart></ResponsiveContainer>{!history.complete && <p className="chart-note">Some dates are unavailable because market data could not be retrieved for an owned listing.</p>}</div>
+}

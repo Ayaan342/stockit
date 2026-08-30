@@ -2,7 +2,7 @@ import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip } from 'recharts'
 import type { Holding } from '../types/api'
 import { money, number } from '../utils/format'
 
-const colors = ['#2fc19d', '#5b6ee1', '#c9952d', '#bd5d66', '#78909c', '#d5d9df']
+const colors = ['#24c7d9', '#3b82f6', '#35c987', '#e7a63c', '#9671e8', '#ef7179', '#6da6c9', '#c789d6']
 
 export function AllocationDonut({ holdings, currency = 'USD' }: { holdings: Holding[]; currency?: string }) {
   if (holdings.some((holding) => holding.current_value === null || holding.allocation_percentage === null)) return <p className="muted compact-empty">Market data unavailable for allocation.</p>

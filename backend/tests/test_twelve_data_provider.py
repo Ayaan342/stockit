@@ -2,8 +2,10 @@ import asyncio
 from decimal import Decimal
 
 import httpx
+import pandas as pd
 import pytest
 
+from app.models.stock import Stock
 from app.services.market_data import MarketDataError, MarketDataProvider, MarketDataService, SymbolNormalizer, TwelveDataProvider, YahooFinanceProvider
 
 
@@ -135,6 +137,19 @@ def test_yahoo_fallback_is_conditional_and_uses_nse_suffix():
     assert details_requested == ["TCS.NS"]
 
 
+def test_yahoo_quote_uses_latest_real_close_when_fast_info_is_unavailable():
+    class Ticker:
+        fast_info = {}
+
+        def history(self, **kwargs):
+            return pd.DataFrame({"Close": [None, 3500.25]})
+
+    requested: list[str] = []
+    provider = YahooFinanceProvider(ticker_factory=lambda symbol: requested.append(symbol) or Ticker())
+    assert asyncio.run(provider.quote("TCS:NSE")) == Decimal("3500.25")
+    assert requested == ["TCS.NS"]
+
+
 def test_successful_primary_does_not_call_yahoo_fallback():
     class Primary(MarketDataProvider):
         async def search(self, query: str): return []
@@ -152,3 +167,52 @@ def test_symbol_normalizer_keeps_exchange_aliases_provider_specific():
     assert SymbolNormalizer.yahoo("TCS", "NSE") == "TCS.NS"
     assert SymbolNormalizer.yahoo("500325", "BSE") == "500325.BO"
     assert SymbolNormalizer.yahoo("AAPL", "NASDAQ") == "AAPL"
+
+
+def test_concurrent_listing_quotes_share_one_provider_call():
+    calls = 0
+
+    class Provider(MarketDataProvider):
+        async def search(self, query: str): return []
+        async def details(self, symbol: str): return {}
+        async def quote(self, symbol: str):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.01)
+            return Decimal("123.45")
+        async def history(self, symbol: str): return []
+
+    service = MarketDataService(Provider())
+    first = Stock(symbol="AAPL", exchange="NASDAQ", name="Apple", currency="USD")
+    second = Stock(symbol="AAPL", exchange="NASDAQ", name="Apple", currency="USD")
+    async def resolve_both():
+        return await asyncio.gather(service.quote_for_stock(first), service.quote_for_stock(second))
+
+    prices = asyncio.run(resolve_both())
+    assert prices == [Decimal("123.450000"), Decimal("123.450000")]
+    assert calls == 1
+
+
+def test_warm_listing_quote_cache_skips_a_second_provider_call():
+    calls = 0
+
+    class Provider(MarketDataProvider):
+        async def search(self, query: str): return []
+        async def details(self, symbol: str): return {}
+        async def history(self, symbol: str): return []
+
+        async def quote(self, symbol: str):
+            nonlocal calls
+            calls += 1
+            return Decimal("123.45")
+
+    service = MarketDataService(Provider())
+    stock = Stock(symbol="AAPL", exchange="NASDAQ", name="Apple", currency="USD")
+
+    async def resolve_twice():
+        first = await service.quote_for_stock(stock)
+        second = await service.quote_for_stock(stock)
+        return first, second
+
+    assert asyncio.run(resolve_twice()) == (Decimal("123.450000"), Decimal("123.450000"))
+    assert calls == 1

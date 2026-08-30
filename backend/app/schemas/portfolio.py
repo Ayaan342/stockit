@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, Field
@@ -76,3 +76,15 @@ class PortfolioResponse(BaseModel):
 class PortfolioPerformancePoint(BaseModel):
     timestamp: datetime
     portfolio_value: Decimal
+
+
+class PortfolioHistoryPoint(BaseModel):
+    date: date
+    value: Decimal | None
+
+
+class PortfolioHistoryResponse(BaseModel):
+    currency: str
+    period: str
+    complete: bool
+    points: list[PortfolioHistoryPoint]

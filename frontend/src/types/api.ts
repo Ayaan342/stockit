@@ -90,3 +90,6 @@ export interface PortfolioPerformancePoint {
   timestamp: string
   portfolio_value: string
 }
+
+export interface PortfolioHistoryPoint { date: string; value: string | null }
+export interface PortfolioHistory { currency: string; period: '30d' | '1y'; complete: boolean; points: PortfolioHistoryPoint[] }

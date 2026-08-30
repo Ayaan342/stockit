@@ -12,6 +12,15 @@ export class ApiError extends Error {
 }
 
 let unauthorizedHandler: (() => void) | undefined
+const cache = new Map<string, { expiresAt: number; value?: Promise<unknown> }>()
+const cached = <T>(key: string, loader: () => Promise<T>, ttl = 20_000): Promise<T> => {
+  const current = cache.get(key)
+  if (current && current.expiresAt > Date.now() && current.value) return current.value as Promise<T>
+  const value = loader().catch((error) => { cache.delete(key); throw error })
+  cache.set(key, { expiresAt: Date.now() + ttl, value })
+  return value
+}
+const invalidate = (...keys: string[]) => keys.forEach((key) => cache.delete(key))
 
 export function setUnauthorizedHandler(handler: (() => void) | undefined) {
   unauthorizedHandler = handler
@@ -73,14 +82,20 @@ export const api = {
   searchStocks: (query: string) => request(`/stocks/search?q=${encodeURIComponent(query)}`),
   stock: (symbol: string, exchange?: string | null) => request(`/stocks/${encodeURIComponent(symbol)}${exchange ? `?exchange=${encodeURIComponent(exchange)}` : ''}`),
   history: (symbol: string, exchange?: string | null) => request(`/stocks/${encodeURIComponent(symbol)}/history${exchange ? `?exchange=${encodeURIComponent(exchange)}` : ''}`),
-  watchlists: () => request('/watchlists', {}, true),
-  createWatchlist: (name: string) => request('/watchlists', { method: 'POST', body: JSON.stringify({ name }) }, true),
-  deleteWatchlist: (id: number) => request(`/watchlists/${id}`, { method: 'DELETE' }, true),
-  addWatchlistStock: (id: number, symbol: string, exchange?: string | null) => request(`/watchlists/${id}/stocks/${encodeURIComponent(symbol)}${exchange ? `?exchange=${encodeURIComponent(exchange)}` : ''}`, { method: 'POST' }, true),
-  removeWatchlistStock: (id: number, symbol: string, exchange?: string | null) => request(`/watchlists/${id}/stocks/${encodeURIComponent(symbol)}${exchange ? `?exchange=${encodeURIComponent(exchange)}` : ''}`, { method: 'DELETE' }, true),
-  portfolio: () => request('/portfolio', {}, true),
-  holdings: () => request('/portfolio/holdings', {}, true),
-  transactions: () => request('/portfolio/transactions', {}, true),
+  watchlists: () => cached('watchlists', () => request('/watchlists', {}, true)),
+  createWatchlist: async (name: string) => { const result = await request('/watchlists', { method: 'POST', body: JSON.stringify({ name }) }, true); invalidate('watchlists'); return result },
+  deleteWatchlist: async (id: number) => { const result = await request(`/watchlists/${id}`, { method: 'DELETE' }, true); invalidate('watchlists'); return result },
+  addWatchlistStock: async (id: number, symbol: string, exchange?: string | null) => { const result = await request(`/watchlists/${id}/stocks/${encodeURIComponent(symbol)}${exchange ? `?exchange=${encodeURIComponent(exchange)}` : ''}`, { method: 'POST' }, true); invalidate('watchlists'); return result },
+  removeWatchlistStock: async (id: number, symbol: string, exchange?: string | null) => { const result = await request(`/watchlists/${id}/stocks/${encodeURIComponent(symbol)}${exchange ? `?exchange=${encodeURIComponent(exchange)}` : ''}`, { method: 'DELETE' }, true); invalidate('watchlists'); return result },
+  portfolio: () => cached('portfolio', () => request('/portfolio', {}, true)),
+  holdings: () => cached('holdings', () => request('/portfolio/holdings', {}, true)),
+  transactions: () => cached('transactions', () => request('/portfolio/transactions', {}, true)),
   performance: () => request('/portfolio/performance', {}, true),
-  trade: (side: 'buy' | 'sell', payload: { symbol: string; exchange?: string | null; quantity: string; price: string; fees: string; notes?: string; executed_at?: string }) => request(`/portfolio/${side}`, { method: 'POST', body: JSON.stringify(payload) }, true),
+  portfolioHistory: (currency: string, period: '30d' | '1y') => cached(`portfolio-history:${currency}:${period}`, () => request(`/portfolio/history?currency=${encodeURIComponent(currency)}&period=${period}`, {}, true), 3_600_000),
+  trade: async (side: 'buy' | 'sell', payload: { symbol: string; exchange?: string | null; quantity: string; price: string; fees: string; notes?: string; executed_at?: string }) => {
+    const result = await request(`/portfolio/${side}`, { method: 'POST', body: JSON.stringify(payload) }, true)
+    invalidate('portfolio', 'holdings', 'transactions', 'portfolio-history:INR:30d', 'portfolio-history:INR:1y', 'portfolio-history:USD:30d', 'portfolio-history:USD:1y')
+    return result
+  },
+  invalidatePortfolioData: () => invalidate('portfolio', 'holdings', 'transactions', 'watchlists'),
 }
