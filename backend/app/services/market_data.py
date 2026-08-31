@@ -3,8 +3,9 @@
 from abc import ABC, abstractmethod
 import asyncio
 import logging
+from dataclasses import dataclass
 from time import perf_counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -21,10 +22,20 @@ logger = logging.getLogger("uvicorn.error")
 
 
 class MarketDataError(Exception):
-    def __init__(self, public_detail: str = "Market data is currently unavailable", status_code: int = 503) -> None:
+    def __init__(self, public_detail: str = "Market data is currently unavailable", status_code: int = 503, *, reason: str | None = None) -> None:
         super().__init__(public_detail)
         self.public_detail = public_detail
         self.status_code = status_code
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class QuoteSnapshot:
+    """A real provider quote plus the time it was obtained and its freshness."""
+
+    price: Decimal
+    as_of: datetime
+    is_stale: bool = False
 
 
 class MarketDataProvider(ABC):
@@ -60,13 +71,21 @@ class TwelveDataProvider(MarketDataProvider):
 
     async def _get(self, path: str, params: dict[str, str]) -> dict:
         try:
+            # httpx applies individual timeout values to connect/read/write/pool
+            # phases. asyncio.wait_for adds the missing end-to-end budget for a
+            # quote request, including DNS, connection, and response reading.
             timeout = httpx.Timeout(settings.market_data_timeout_seconds, connect=min(settings.market_data_timeout_seconds, 2.0))
             async with httpx.AsyncClient(timeout=timeout, transport=self._transport) as client:
-                response = await client.get(f"{self._base_url}{path}", params=params, headers=self._headers())
+                response = await asyncio.wait_for(
+                    client.get(f"{self._base_url}{path}", params=params, headers=self._headers()),
+                    timeout=settings.market_data_timeout_seconds,
+                )
+        except asyncio.TimeoutError as exc:
+            raise MarketDataError("Market data provider timed out", reason="timeout") from exc
         except httpx.TimeoutException as exc:
-            raise MarketDataError("Market data provider timed out") from exc
+            raise MarketDataError("Market data provider timed out", reason="timeout") from exc
         except httpx.HTTPError as exc:
-            raise MarketDataError("Market data provider request failed") from exc
+            raise MarketDataError("Market data provider request failed", reason="request_failed") from exc
         if response.status_code == 429:
             raise MarketDataError("Market data rate limit reached", status_code=429)
         if response.status_code in {401, 403} or response.status_code >= 500:
@@ -309,8 +328,10 @@ class MarketDataService:
         self.provider = provider
         self.fallback_provider = fallback_provider
         self._history_cache: dict[tuple[str, str, int], tuple[datetime, list[StockHistoryPoint]]] = {}
-        self._quote_cache: dict[tuple[str, str], tuple[datetime, Decimal]] = {}
-        self._quote_tasks: dict[tuple[str, str], asyncio.Task[Decimal]] = {}
+        self._quote_cache: dict[tuple[str, str], QuoteSnapshot] = {}
+        self._quote_tasks: dict[tuple[str, str], asyncio.Task[QuoteSnapshot]] = {}
+        self._primary_quote_unhealthy_until: datetime | None = None
+        self._primary_quote_not_found_until: dict[str, datetime] = {}
 
     async def search(self, db: Session, query: str) -> list[Stock]:
         results = await self.provider.search(query)
@@ -356,11 +377,39 @@ class MarketDataService:
 
     async def _primary_or_fallback(self, operation: str, symbol: str):
         started = perf_counter()
+        primary_on_cooldown = (
+            operation == "quote"
+            and self._primary_quote_unhealthy_until is not None
+            and datetime.now(timezone.utc) < self._primary_quote_unhealthy_until
+        )
+        listing_not_found_until = self._primary_quote_not_found_until.get(symbol)
+        listing_on_cooldown = (
+            operation == "quote"
+            and listing_not_found_until is not None
+            and datetime.now(timezone.utc) < listing_not_found_until
+        )
+        if (primary_on_cooldown or listing_on_cooldown) and self.fallback_provider is not None:
+            fallback_started = perf_counter()
+            try:
+                result = await getattr(self.fallback_provider, operation)(symbol)
+                logger.info(
+                    "market_timing provider=yahoo operation=%s symbol=%s elapsed_ms=%.1f primary_cooldown=%s listing_not_found_cooldown=%s",
+                    operation, symbol, (perf_counter() - fallback_started) * 1000, primary_on_cooldown, listing_on_cooldown,
+                )
+                return result
+            except MarketDataError:
+                # Do not retry a provider deliberately placed on cooldown.
+                raise
         try:
             result = await getattr(self.provider, operation)(symbol)
             logger.info("market_timing provider=twelve operation=%s symbol=%s elapsed_ms=%.1f", operation, symbol, (perf_counter() - started) * 1000)
             return result
         except MarketDataError as primary_error:
+            logger.info("market_timing provider=twelve operation=%s symbol=%s elapsed_ms=%.1f failed=true reason=%s", operation, symbol, (perf_counter() - started) * 1000, primary_error.reason or primary_error.status_code)
+            if operation == "quote" and primary_error.reason in {"timeout", "request_failed"}:
+                self._primary_quote_unhealthy_until = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=settings.market_primary_cooldown_seconds)
+            if operation == "quote" and primary_error.status_code == 404:
+                self._primary_quote_not_found_until[symbol] = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=settings.market_primary_cooldown_seconds)
             # A Twelve Data 429 is explicit and should reach the caller; a
             # fallback retry would hide the rate-limit state and waste calls.
             if primary_error.status_code == 429 or self.fallback_provider is None:
@@ -415,8 +464,12 @@ class MarketDataService:
         ).total_seconds() > settings.market_cache_seconds
         if stale:
             try:
-                stock.last_price = await self._primary_or_fallback("quote", provider_symbol(stock.symbol, stock.exchange))
-                stock.last_price_updated_at = datetime.now(timezone.utc)
+                snapshot = await self.quote_snapshot_for_stock(stock)
+                # A stale snapshot is useful reference data but must retain its
+                # original timestamp instead of being relabelled as current.
+                if not snapshot.is_stale:
+                    stock.last_price = snapshot.price
+                    stock.last_price_updated_at = snapshot.as_of
             except MarketDataError:
                 if require_price:
                     raise
@@ -426,32 +479,72 @@ class MarketDataService:
             raise MarketDataError("No current market price is available")
         return stock
 
-    async def quote_for_stock(self, stock: Stock) -> Decimal:
-        """Resolve one listing quote once across concurrent valuation requests."""
-        key = (stock.symbol, stock.exchange)
-        now = datetime.now(timezone.utc)
-        if stock.last_price is not None and stock.last_price_updated_at is not None and (
-            now - self._as_utc(stock.last_price_updated_at)
-        ).total_seconds() <= settings.market_cache_seconds:
-            logger.info("market_timing quote_cache=db symbol=%s exchange=%s", *key)
-            return stock.last_price
-        cached = self._quote_cache.get(key)
-        if cached and (now - cached[0]).total_seconds() <= settings.market_cache_seconds:
-            logger.info("market_timing quote_cache=memory symbol=%s exchange=%s", *key)
-            return cached[1]
+    def _quote_age_seconds(self, snapshot: QuoteSnapshot, now: datetime) -> float:
+        return (now - self._as_utc(snapshot.as_of)).total_seconds()
+
+    def _start_quote_refresh(self, key: tuple[str, str]) -> asyncio.Task[QuoteSnapshot]:
         task = self._quote_tasks.get(key)
         if task is None:
-            logger.info("market_timing quote_cache=miss symbol=%s exchange=%s", *key)
-            task = asyncio.create_task(self._primary_or_fallback("quote", provider_symbol(*key)))
+            async def refresh() -> QuoteSnapshot:
+                price = await self._primary_or_fallback("quote", provider_symbol(*key))
+                snapshot = QuoteSnapshot(
+                    price=price.quantize(Decimal("0.000001")),
+                    as_of=datetime.now(timezone.utc),
+                )
+                self._quote_cache[key] = snapshot
+                return snapshot
+
+            task = asyncio.create_task(refresh())
             self._quote_tasks[key] = task
-        try:
-            price = await asyncio.shield(task)
-            price = price.quantize(Decimal("0.000001"))
-            self._quote_cache[key] = (datetime.now(timezone.utc), price)
-            return price
-        finally:
-            if task.done():
-                self._quote_tasks.pop(key, None)
+
+            def clear_finished_task(completed: asyncio.Task[QuoteSnapshot]) -> None:
+                if self._quote_tasks.get(key) is completed:
+                    self._quote_tasks.pop(key, None)
+                # Background stale refreshes have no awaiting request. Reading
+                # the exception prevents an unobserved-task warning while the
+                # last known real quote remains available.
+                if not completed.cancelled():
+                    try:
+                        completed.exception()
+                    except (asyncio.CancelledError, MarketDataError):
+                        pass
+
+            task.add_done_callback(clear_finished_task)
+        return task
+
+    async def quote_snapshot_for_stock(self, stock: Stock) -> QuoteSnapshot:
+        """Return fresh data when available, otherwise a bounded stale real quote.
+
+        A stale quote is only a previously provider-obtained value. It is never
+        relabelled as fresh, and an asynchronous refresh is shared by all
+        concurrent callers for the same exchange-aware listing.
+        """
+        key = (stock.symbol, stock.exchange)
+        now = datetime.now(timezone.utc)
+        candidates: list[tuple[str, QuoteSnapshot]] = []
+        if stock.last_price is not None and stock.last_price_updated_at is not None:
+            candidates.append(("db", QuoteSnapshot(stock.last_price, self._as_utc(stock.last_price_updated_at))))
+        memory_snapshot = self._quote_cache.get(key)
+        if memory_snapshot is not None:
+            candidates.append(("memory", memory_snapshot))
+
+        if candidates:
+            source, snapshot = min(candidates, key=lambda item: self._quote_age_seconds(item[1], now))
+            age_seconds = self._quote_age_seconds(snapshot, now)
+            if age_seconds <= settings.market_cache_seconds:
+                logger.info("market_timing quote_cache=%s symbol=%s exchange=%s freshness=fresh age_ms=%.1f", source, *key, age_seconds * 1000)
+                return snapshot
+            if age_seconds <= settings.market_stale_cache_seconds:
+                logger.info("market_timing quote_cache=%s symbol=%s exchange=%s freshness=stale age_ms=%.1f", source, *key, age_seconds * 1000)
+                self._start_quote_refresh(key)
+                return QuoteSnapshot(snapshot.price, snapshot.as_of, is_stale=True)
+
+        logger.info("market_timing quote_cache=miss symbol=%s exchange=%s", *key)
+        return await asyncio.shield(self._start_quote_refresh(key))
+
+    async def quote_for_stock(self, stock: Stock) -> Decimal:
+        """Compatibility wrapper for consumers that only need the price."""
+        return (await self.quote_snapshot_for_stock(stock)).price
 
     async def history(self, symbol: str, *, exchange: str | None = None) -> list[StockHistoryPoint]:
         return await self.history_for_days(symbol, exchange=exchange, days=30)

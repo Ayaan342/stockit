@@ -6,7 +6,7 @@ from time import perf_counter
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
@@ -48,22 +48,31 @@ async def valued_holdings(db: Session, portfolio: Portfolio, market: MarketDataS
         select(Holding).options(joinedload(Holding.stock)).where(Holding.portfolio_id == portfolio.id).order_by(Holding.id)
     ).all()
     logger.info("portfolio_timing stage=holdings_db portfolio_id=%s elapsed_ms=%.1f", portfolio.id, (perf_counter() - db_started) * 1000)
+    # Do not pin a PostgreSQL connection while these independent quote tasks
+    # wait on remote providers. expire_on_commit=False keeps the loaded ledger
+    # snapshot usable; a new short transaction is opened only if fresh pricing
+    # needs to be persisted below.
+    db.commit()
     quote_started = perf_counter()
+    logger.info("portfolio_timing stage=valuation_quote_start portfolio_id=%s", portfolio.id)
     quote_results = await asyncio.gather(
-        *(market.quote_for_stock(holding.stock) for holding in holdings), return_exceptions=True
+        *(market.quote_snapshot_for_stock(holding.stock) for holding in holdings), return_exceptions=True
     )
     logger.info("portfolio_timing stage=holdings_quotes portfolio_id=%s holdings=%s elapsed_ms=%.1f", portfolio.id, len(holdings), (perf_counter() - quote_started) * 1000)
     responses: list[HoldingResponse] = []
+    fresh_quotes_persisted = False
     for holding, quote in zip(holdings, quote_results, strict=True):
         if isinstance(quote, Exception):
             # A position is recorded accounting data. Market valuation is
             # optional enrichment and must never hide a valid holding.
             responses.append(holding_response(holding, None))
         else:
-            holding.stock.last_price = quote
-            holding.stock.last_price_updated_at = datetime.now(timezone.utc)
-            responses.append(holding_response(holding, quote))
-    if holdings:
+            if not quote.is_stale:
+                holding.stock.last_price = quote.price
+                holding.stock.last_price_updated_at = quote.as_of
+                fresh_quotes_persisted = True
+            responses.append(holding_response(holding, quote.price))
+    if fresh_quotes_persisted:
         db.commit()
     currency_totals: dict[str, Decimal] = {}
     for item in responses:
@@ -158,13 +167,25 @@ async def list_holdings(
 
 
 @router.get("/transactions", response_model=list[TransactionResponse])
-def list_transactions(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[TransactionResponse]:
-    started = perf_counter()
-    transactions = db.scalars(
+def list_transactions(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[TransactionResponse]:
+    handler_started = perf_counter()
+    logger.info("portfolio_timing stage=transactions_handler_start user_id=%s", current_user.id)
+    query_started = perf_counter()
+    transactions = list(db.scalars(
         select(Transaction).options(joinedload(Transaction.stock)).where(Transaction.user_id == current_user.id).order_by(Transaction.created_at.desc(), Transaction.id.desc())
-    )
+    ))
+    query_elapsed = (perf_counter() - query_started) * 1000
+    serialization_started = perf_counter()
     response = [transaction_response(transaction) for transaction in transactions]
-    logger.info("portfolio_timing stage=transactions_db user_id=%s rows=%s elapsed_ms=%.1f", current_user.id, len(response), (perf_counter() - started) * 1000)
+    serialization_elapsed = (perf_counter() - serialization_started) * 1000
+    total_elapsed = (perf_counter() - handler_started) * 1000
+    logger.info("portfolio_timing stage=transactions_query user_id=%s rows=%s elapsed_ms=%.1f", current_user.id, len(response), query_elapsed)
+    logger.info("portfolio_timing stage=transactions_serialization user_id=%s elapsed_ms=%.1f", current_user.id, serialization_elapsed)
+    logger.info("portfolio_timing stage=transactions_handler_total user_id=%s elapsed_ms=%.1f", current_user.id, total_elapsed)
+    if hasattr(request.state, "timings"):
+        request.state.timings["transactions_query"] = query_elapsed
+        request.state.timings["transactions_serialization"] = serialization_elapsed
+        request.state.timings["transactions_handler"] = total_elapsed
     return response
 
 

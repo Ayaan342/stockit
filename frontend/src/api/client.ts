@@ -32,10 +32,12 @@ export function getStoredToken() {
 
 export function setStoredToken(token: string) {
   localStorage.setItem(tokenKey, token)
+  invalidate('me')
 }
 
 export function clearStoredToken() {
   localStorage.removeItem(tokenKey)
+  invalidate('me')
 }
 
 function errorMessage(payload: unknown): string {
@@ -77,11 +79,16 @@ async function request<T>(path: string, options: RequestInit = {}, authenticated
 export const api = {
   register: (name: string, email: string, password: string) => request('/auth/register', { method: 'POST', body: JSON.stringify({ name, email, password }) }),
   login: (email: string, password: string) => request<{ access_token: string; token_type: string }>('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
-  me: () => request('/auth/me', {}, true),
+  // React StrictMode intentionally remounts providers in development. Sharing
+  // the in-flight current-user request avoids duplicate logical `/me` calls.
+  me: () => cached('me', () => request('/auth/me', {}, true), 30_000),
   stocks: (limit = 50) => request(`/stocks?limit=${limit}`),
   searchStocks: (query: string) => request(`/stocks/search?q=${encodeURIComponent(query)}`),
   stock: (symbol: string, exchange?: string | null) => request(`/stocks/${encodeURIComponent(symbol)}${exchange ? `?exchange=${encodeURIComponent(exchange)}` : ''}`),
-  history: (symbol: string, exchange?: string | null) => request(`/stocks/${encodeURIComponent(symbol)}/history${exchange ? `?exchange=${encodeURIComponent(exchange)}` : ''}`),
+  history: (symbol: string, exchange?: string | null) => {
+    const listing = `${symbol.toUpperCase()}:${exchange?.toUpperCase() ?? ''}`
+    return cached(`stock-history:${listing}`, () => request(`/stocks/${encodeURIComponent(symbol)}/history${exchange ? `?exchange=${encodeURIComponent(exchange)}` : ''}`), 10 * 60_000)
+  },
   watchlists: () => cached('watchlists', () => request('/watchlists', {}, true)),
   createWatchlist: async (name: string) => { const result = await request('/watchlists', { method: 'POST', body: JSON.stringify({ name }) }, true); invalidate('watchlists'); return result },
   deleteWatchlist: async (id: number) => { const result = await request(`/watchlists/${id}`, { method: 'DELETE' }, true); invalidate('watchlists'); return result },

@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
@@ -113,6 +114,23 @@ def test_twelve_data_provider_failure_is_not_exposed():
     assert error.value.public_detail == "Market data provider is currently unavailable"
 
 
+def test_twelve_data_enforces_an_end_to_end_timeout_budget():
+    from app.core.config import settings
+
+    async def delayed_handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.03)
+        return httpx.Response(200, json={"symbol": "AAPL", "close": "123"})
+
+    previous_timeout = settings.market_data_timeout_seconds
+    settings.market_data_timeout_seconds = 0.01
+    try:
+        with pytest.raises(MarketDataError) as error:
+            asyncio.run(provider_with(delayed_handler).quote("AAPL"))
+        assert error.value.reason == "timeout"
+    finally:
+        settings.market_data_timeout_seconds = previous_timeout
+
+
 def test_yahoo_fallback_is_conditional_and_uses_nse_suffix():
     class FailingPrimary(MarketDataProvider):
         async def search(self, query: str): raise MarketDataError(status_code=503)
@@ -216,3 +234,80 @@ def test_warm_listing_quote_cache_skips_a_second_provider_call():
 
     assert asyncio.run(resolve_twice()) == (Decimal("123.450000"), Decimal("123.450000"))
     assert calls == 1
+
+
+def test_stale_real_quote_returns_immediately_and_shares_one_background_refresh():
+    from app.core.config import settings
+
+    calls = 0
+
+    class Provider(MarketDataProvider):
+        async def search(self, query: str): return []
+        async def details(self, symbol: str): return {}
+        async def history(self, symbol: str): return []
+
+        async def quote(self, symbol: str):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.01)
+            return Decimal("125")
+
+    previous_fresh = settings.market_cache_seconds
+    previous_stale = settings.market_stale_cache_seconds
+    settings.market_cache_seconds = 1
+    settings.market_stale_cache_seconds = 60
+    try:
+        service = MarketDataService(Provider())
+        stock = Stock(
+            symbol="AAPL", exchange="NASDAQ", name="Apple", currency="USD",
+            last_price=Decimal("123"), last_price_updated_at=datetime.now(timezone.utc) - timedelta(seconds=2),
+        )
+
+        async def resolve_stale_twice():
+            first, second = await asyncio.gather(service.quote_snapshot_for_stock(stock), service.quote_snapshot_for_stock(stock))
+            await asyncio.sleep(0.02)
+            return first, second
+
+        first, second = asyncio.run(resolve_stale_twice())
+        assert first.price == Decimal("123") and first.is_stale is True
+        assert second.price == Decimal("123") and second.is_stale is True
+        assert calls == 1
+    finally:
+        settings.market_cache_seconds = previous_fresh
+        settings.market_stale_cache_seconds = previous_stale
+
+
+def test_twelve_listing_not_found_uses_yahoo_directly_on_the_next_quote():
+    from app.core.config import settings
+
+    primary_calls = 0
+    fallback_calls = 0
+
+    class Twelve(MarketDataProvider):
+        async def search(self, query: str): return []
+        async def details(self, symbol: str): return {}
+        async def history(self, symbol: str): return []
+        async def quote(self, symbol: str):
+            nonlocal primary_calls
+            primary_calls += 1
+            raise MarketDataError("Stock data was not found", status_code=404)
+
+    class Yahoo(MarketDataProvider):
+        async def search(self, query: str): return []
+        async def details(self, symbol: str): return {}
+        async def history(self, symbol: str): return []
+        async def quote(self, symbol: str):
+            nonlocal fallback_calls
+            fallback_calls += 1
+            return Decimal("3500")
+
+    previous_cooldown = settings.market_primary_cooldown_seconds
+    settings.market_primary_cooldown_seconds = 30
+    try:
+        service = MarketDataService(Twelve(), Yahoo())
+        assert asyncio.run(service._primary_or_fallback("quote", "TCS:NSE")) == Decimal("3500")
+        assert asyncio.run(service._primary_or_fallback("quote", "TCS:NSE")) == Decimal("3500")
+        assert primary_calls == 1
+        assert fallback_calls == 2
+    finally:
+        settings.market_primary_cooldown_seconds = previous_cooldown

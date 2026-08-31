@@ -40,16 +40,25 @@ def owned_watchlist(db: Session, user_id: int, watchlist_id: int) -> Watchlist:
 
 @router.get("", response_model=list[WatchlistResponse])
 def list_watchlists(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[WatchlistResponse]:
-    started = perf_counter()
-    watchlists = db.scalars(
+    handler_started = perf_counter()
+    logger.info("portfolio_timing stage=watchlists_handler_start user_id=%s", current_user.id)
+    query_started = perf_counter()
+    watchlists = list(db.scalars(
         select(Watchlist).options(selectinload(Watchlist.stocks).selectinload(WatchlistStock.stock)).where(
             Watchlist.user_id == current_user.id
         ).order_by(Watchlist.created_at)
-    )
+    ))
+    query_elapsed = (perf_counter() - query_started) * 1000
+    serialization_started = perf_counter()
     response = [serialize(watchlist) for watchlist in watchlists]
-    elapsed_ms = (perf_counter() - started) * 1000
-    logger.info("portfolio_timing stage=watchlists_db user_id=%s rows=%s elapsed_ms=%.1f", current_user.id, len(response), elapsed_ms)
-    request.state.timings["watchlists_db"] = elapsed_ms
+    serialization_elapsed = (perf_counter() - serialization_started) * 1000
+    total_elapsed = (perf_counter() - handler_started) * 1000
+    logger.info("portfolio_timing stage=watchlists_query user_id=%s rows=%s elapsed_ms=%.1f", current_user.id, len(response), query_elapsed)
+    logger.info("portfolio_timing stage=watchlists_serialization user_id=%s elapsed_ms=%.1f", current_user.id, serialization_elapsed)
+    logger.info("portfolio_timing stage=watchlists_handler_total user_id=%s elapsed_ms=%.1f", current_user.id, total_elapsed)
+    request.state.timings["watchlists_query"] = query_elapsed
+    request.state.timings["watchlists_serialization"] = serialization_elapsed
+    request.state.timings["watchlists_handler"] = total_elapsed
     return response
 
 

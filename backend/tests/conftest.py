@@ -56,7 +56,7 @@ class FakeMarketProvider(MarketDataProvider):
 @pytest.fixture()
 def client():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
-    testing_session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    testing_session = sessionmaker(autocommit=False, autoflush=False, bind=engine, expire_on_commit=False)
     Base.metadata.create_all(bind=engine)
 
     def override_get_db():

@@ -24,6 +24,7 @@ _TIMED_PATHS = frozenset({
     "/api/v1/portfolio/holdings",
     "/api/v1/portfolio/transactions",
     "/api/v1/watchlists",
+    "/health",
 })
 
 
@@ -33,8 +34,12 @@ async def log_request_timing(request: Request, call_next):
     if request.url.path not in _TIMED_PATHS:
         return await call_next(request)
     started = perf_counter()
-    request.state.timings = {}
+    request.state.timings = {"middleware_entered": 0.0}
+    logger.info("request_timing stage=middleware_entered path=%s", request.url.path)
     response = await call_next(request)
+    response_ready_ms = (perf_counter() - started) * 1000
+    request.state.timings["response_ready"] = response_ready_ms
+    logger.info("request_timing stage=response_ready path=%s elapsed_ms=%.1f", request.url.path, response_ready_ms)
     total_ms = (perf_counter() - started) * 1000
     timing_values = request.state.timings
     server_timing = [f"{name};dur={duration:.1f}" for name, duration in timing_values.items()]

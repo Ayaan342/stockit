@@ -1,14 +1,13 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Bar, BarChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { api, ApiError } from '../api/client'
+import { AllocationDonut } from '../components/AllocationDonut'
+import { HoldingPnlChart } from '../components/HoldingPnlChart'
 import { ErrorState, Loading, MetricCard } from '../components/Ui'
 import { MarketSelector } from '../components/MarketSelector'
 import { PortfolioHistoryChart } from '../components/PortfolioHistoryChart'
 import type { Holding, Portfolio, PortfolioHistory, Transaction, Watchlist } from '../types/api'
 import { dateTime, money, number, pnlClass } from '../utils/format'
-
-const allocationColors = ['#24c7d9', '#3b82f6', '#35c987', '#e7a63c', '#9671e8', '#ef7179', '#6da6c9', '#c789d6']
 
 export function DashboardPage() {
   const [portfolio, setPortfolio] = useState<Portfolio>()
@@ -49,14 +48,10 @@ export function DashboardPage() {
 
   const activeGroup = portfolio.groups.find((group) => group.currency === selectedCurrency) ?? portfolio.groups[0]
   const activeHoldings = holdings.filter((holding) => holding.currency === activeGroup?.currency)
-  const allocation = activeHoldings.length > 0 && activeHoldings.every((holding) => holding.current_value !== null && holding.allocation_percentage !== null)
-    ? activeHoldings.map((holding) => ({ ...holding, value: Number(holding.current_value), percentage: Number(holding.allocation_percentage) })).filter((holding) => holding.value > 0)
-    : []
   const rankedHoldings = [...activeHoldings].filter((holding) => holding.profit_loss !== null).sort((left, right) => Number(right.profit_loss) - Number(left.profit_loss))
   const bestHolding = rankedHoldings[0]
   const worstHolding = rankedHoldings[rankedHoldings.length - 1]
   const chartCurrency = activeGroup?.currency
-  const gainLoss = activeHoldings.filter((holding) => holding.profit_loss !== null).map((holding) => ({ symbol: holding.symbol, value: Number(holding.profit_loss) }))
 
   return <>
     <section className="page-heading">
@@ -71,7 +66,7 @@ export function DashboardPage() {
     </section></section>}
     <section className="portfolio-chart-grid"><article className="panel portfolio-growth-panel"><div className="panel-heading"><div><p className="eyebrow">Portfolio growth</p><h2>12 months</h2></div></div><PortfolioHistoryChart history={growthHistory} monthly /></article><article className="panel allocation-panel">
       <div className="panel-heading"><div><h2>Holdings allocation</h2><p className="muted">Current market value by position</p></div></div>
-      {allocation.length ? <><div className="allocation-chart"><ResponsiveContainer width="100%" height={190}><PieChart><Pie data={allocation} dataKey="value" nameKey="symbol" innerRadius={52} outerRadius={76} paddingAngle={2} strokeWidth={0}>{allocation.map((holding, index) => <Cell key={holding.symbol} fill={allocationColors[index % allocationColors.length]} />)}</Pie><Tooltip /></PieChart></ResponsiveContainer><div className="donut-center"><span>Holdings</span><strong>{money(activeGroup?.current_holdings_value, activeGroup?.currency)}</strong></div></div><div className="allocation-legend">{allocation.map((holding, index) => <div key={holding.symbol}><i style={{ background: allocationColors[index % allocationColors.length] }} /><strong>{holding.symbol}</strong><span>{money(holding.current_value, activeGroup?.currency)} · {number(holding.percentage)}%</span></div>)}</div></> : <p className="muted compact-empty">{holdings.length ? 'Allocation is unavailable until current market values are returned.' : 'No holdings yet. Buy stocks to build your allocation.'}</p>}
+      <AllocationDonut holdings={activeHoldings} currency={activeGroup?.currency} />
     </article></section>
     <section className="dashboard-main">
       <article className="panel performance-panel">
@@ -88,7 +83,7 @@ export function DashboardPage() {
     </section>
     <section className="panel history-wide-panel"><div className="panel-heading"><div><p className="eyebrow">Portfolio value</p><h2>Last 30 days</h2></div></div><PortfolioHistoryChart history={shortHistory} /></section>
     <section className="dashboard-lower">
-      <article className="panel gain-loss-panel"><div className="panel-heading"><div><h2>Gain / loss by holding</h2><p className="muted">{chartCurrency || 'Selected'} holdings only</p></div></div>{gainLoss.length ? <ResponsiveContainer width="100%" height={220}><BarChart data={gainLoss} layout="vertical" margin={{ left: 4, right: 18 }}><XAxis type="number" hide /><YAxis type="category" dataKey="symbol" width={52} /><Tooltip formatter={(value) => money(value as number, chartCurrency)} /><Bar dataKey="value" fill="#18b59f" radius={[3, 3, 3, 3]} /></BarChart></ResponsiveContainer> : <p className="muted compact-empty">Market data unavailable for gain/loss analysis.</p>}</article>
+      <article className="panel gain-loss-panel"><div className="panel-heading"><div><h2>Gain / loss by holding</h2><p className="muted">{chartCurrency || 'Selected'} holdings only</p></div></div><HoldingPnlChart holdings={activeHoldings} currency={chartCurrency ?? 'USD'} /></article>
       <article className="panel"><div className="panel-heading"><h2>Watchlists</h2><Link to="/watchlists">Manage</Link></div>{watchlists.length ? <ul className="simple-list">{watchlists.slice(0, 4).map((list) => <li key={list.id}><span className="list-mark">{list.name.charAt(0).toUpperCase()}</span><strong>{list.name}</strong><span>{list.stocks.length} stocks</span></li>)}</ul> : <p className="muted">Create a watchlist to keep an eye on stocks.</p>}</article>
       <article className="panel"><div className="panel-heading"><h2>Recent transactions</h2><Link to="/transactions">View all</Link></div>{transactions.length ? <div className="compact-transactions">{transactions.slice(0, 4).map((transaction) => <div key={transaction.id}><span className={`badge ${transaction.transaction_type.toLowerCase()}`}>{transaction.transaction_type}</span><strong>{transaction.symbol} · {transaction.exchange}</strong><span>{number(transaction.quantity)} {Number(transaction.quantity) === 1 ? 'share' : 'shares'}</span><b>{money(transaction.total_amount, transaction.currency)}</b><small>{dateTime(transaction.created_at)}</small></div>)}</div> : <p className="muted">No transactions yet.</p>}</article>
     </section>
