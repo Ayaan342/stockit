@@ -39,6 +39,7 @@ class QuoteSnapshot:
 
 
 class MarketDataProvider(ABC):
+    provider_name = "market"
     @abstractmethod
     async def search(self, query: str) -> list[dict]: ...
 
@@ -54,6 +55,8 @@ class MarketDataProvider(ABC):
 
 class TwelveDataProvider(MarketDataProvider):
     """Twelve Data REST adapter, isolated from StockIt's API and trade logic."""
+
+    provider_name = "twelve"
 
     SEARCH_RESULT_LIMIT = 20
     _US_PRIMARY_EXCHANGES = frozenset({"NASDAQ", "NYSE", "NYSE ARCA", "AMEX"})
@@ -209,6 +212,17 @@ class TwelveDataProvider(MarketDataProvider):
 class SymbolNormalizer:
     """Centralizes canonical listing identities and provider-specific symbols."""
 
+    _EXCHANGE_ALIASES = {
+        "NMS": "NASDAQ",
+        "NASDAQGS": "NASDAQ",
+        "NASDAQ GLOBAL SELECT MARKET": "NASDAQ",
+        "NASDAQ CAPITAL MARKET": "NASDAQ",
+        "NYQ": "NYSE",
+        "NYSEARCA": "NYSE ARCA",
+        "PCX": "NYSE ARCA",
+        "ASE": "AMEX",
+    }
+
     @staticmethod
     def split(symbol: str) -> tuple[str, str | None]:
         normalized = symbol.strip().upper()
@@ -216,9 +230,14 @@ class SymbolNormalizer:
         return base, exchange if separator and exchange else None
 
     @classmethod
+    def exchange(cls, exchange: str | None) -> str:
+        normalized = (exchange or "").strip().upper()
+        return cls._EXCHANGE_ALIASES.get(normalized, normalized)
+
+    @classmethod
     def listing(cls, symbol: str, exchange: str | None = None) -> tuple[str, str]:
         base, embedded_exchange = cls.split(symbol)
-        return base, (exchange or embedded_exchange or "").strip().upper()
+        return base, cls.exchange(exchange or embedded_exchange)
 
     @classmethod
     def twelve(cls, symbol: str, exchange: str | None = None) -> str:
@@ -244,7 +263,9 @@ def provider_symbol(symbol: str, exchange: str | None = None) -> str:
 
 
 class YahooFinanceProvider(MarketDataProvider):
-    """Server-side yfinance fallback. It is only called after Twelve Data fails."""
+    """Server-side yfinance adapter for exchange-aware quotes and history."""
+
+    provider_name = "yahoo"
 
     def __init__(self, ticker_factory=None) -> None:
         self._ticker_factory = ticker_factory
@@ -274,7 +295,7 @@ class YahooFinanceProvider(MarketDataProvider):
         return {
             "symbol": base,
             "name": info.get("longName") or info.get("shortName") or base,
-            "exchange": exchange or info.get("exchange") or "",
+            "exchange": exchange or SymbolNormalizer.exchange(info.get("fullExchangeName") or info.get("exchange")),
             "currency": info.get("currency") or ("INR" if exchange in {"NSE", "BSE"} else "USD"),
         }
 
@@ -282,8 +303,11 @@ class YahooFinanceProvider(MarketDataProvider):
         ticker = self._ticker(SymbolNormalizer.yahoo(symbol))
         raw_price = None
         try:
-            fast_info = await asyncio.to_thread(lambda: ticker.fast_info)
-            raw_price = (fast_info.get("last_price") or fast_info.get("regular_market_price")) if fast_info else None
+            # `fast_info` resolves fields lazily in yfinance. Keep both its
+            # creation and value access off FastAPI's event loop.
+            raw_price = await asyncio.to_thread(
+                lambda: ticker.fast_info.get("last_price") or ticker.fast_info.get("regular_market_price")
+            )
             price = Decimal(str(raw_price)) if raw_price is not None else Decimal("0")
         except (Exception, InvalidOperation, TypeError):
             price = Decimal("0")
@@ -303,21 +327,51 @@ class YahooFinanceProvider(MarketDataProvider):
         return price
 
     async def history_for_days(self, symbol: str, days: int) -> list[StockHistoryPoint]:
-        ticker = self._ticker(SymbolNormalizer.yahoo(symbol))
+        ticker_symbol = SymbolNormalizer.yahoo(symbol)
+        ticker = self._ticker(ticker_symbol)
+        period = "1y" if days > 35 else "1mo"
+        started = perf_counter()
         try:
-            period = "1y" if days > 35 else "1mo"
             frame = await asyncio.to_thread(lambda: ticker.history(period=period, interval="1d", auto_adjust=False))
             if frame is None or frame.empty:
                 raise ValueError("empty history")
-            return [
-                StockHistoryPoint(timestamp=index.to_pydatetime().astimezone(timezone.utc), close=Decimal(str(row["Close"])))
-                for index, row in frame.iterrows()
-                if Decimal(str(row["Close"])) > 0
-            ]
-        except MarketDataError:
-            raise
+            closes = frame["Close"]
+            # A single-ticker yfinance response is normally a Series. Accept a
+            # one-column DataFrame too, but do not silently choose from a
+            # multi-listing response.
+            if getattr(closes, "ndim", 1) > 1:
+                if closes.shape[1] != 1:
+                    raise ValueError("ambiguous Close columns")
+                closes = closes.iloc[:, 0]
+            points: list[StockHistoryPoint] = []
+            for index, raw_close in closes.items():
+                try:
+                    close = Decimal(str(raw_close))
+                except (InvalidOperation, TypeError, ValueError):
+                    continue
+                # A current/incomplete market row can legitimately have a NaN
+                # Close. It is not a provider-wide failure and must not discard
+                # earlier daily closes.
+                if not close.is_finite() or close <= 0:
+                    continue
+                timestamp = index.to_pydatetime()
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                points.append(StockHistoryPoint(timestamp=timestamp.astimezone(timezone.utc), close=close))
+            if not points:
+                raise ValueError("history contains no finite Close values")
+            logger.info(
+                "market_timing provider=yahoo method=Ticker.history symbol=%s ticker=%s period=%s interval=1d auto_adjust=false rows=%s valid_close_rows=%s first=%s last=%s latest_close=%s elapsed_ms=%.1f",
+                symbol, ticker_symbol, period, len(frame), len(points), points[0].timestamp.isoformat(), points[-1].timestamp.isoformat(), points[-1].close,
+                (perf_counter() - started) * 1000,
+            )
+            return points
         except Exception as exc:
-            raise MarketDataError("Market data provider is currently unavailable") from exc
+            logger.warning(
+                "market_timing provider=yahoo method=Ticker.history symbol=%s ticker=%s period=%s interval=1d auto_adjust=false error_type=%s error=%s elapsed_ms=%.1f",
+                symbol, ticker_symbol, period, type(exc).__name__, str(exc), (perf_counter() - started) * 1000,
+            )
+            raise MarketDataError("Market data provider is currently unavailable", reason="yahoo_history_failed") from exc
 
     async def history(self, symbol: str) -> list[StockHistoryPoint]:
         return await self.history_for_days(symbol, 30)
@@ -328,13 +382,20 @@ class MarketDataService:
         self.provider = provider
         self.fallback_provider = fallback_provider
         self._history_cache: dict[tuple[str, str, int], tuple[datetime, list[StockHistoryPoint]]] = {}
+        # One provider request may serve every concurrent consumer of the same
+        # listing/range. This complements (rather than replaces) the cache:
+        # failed tasks never become cached historical data.
+        self._history_tasks: dict[tuple[str, str, int], asyncio.Task[list[StockHistoryPoint]]] = {}
         self._quote_cache: dict[tuple[str, str], QuoteSnapshot] = {}
         self._quote_tasks: dict[tuple[str, str], asyncio.Task[QuoteSnapshot]] = {}
         self._primary_quote_unhealthy_until: datetime | None = None
         self._primary_quote_not_found_until: dict[str, datetime] = {}
 
     async def search(self, db: Session, query: str) -> list[Stock]:
-        results = await self.provider.search(query)
+        # Yahoo does not expose an equivalent low-cost symbol-search API. Its
+        # immediate unsupported-search response is handled by the generic
+        # fallback path, which delegates listing discovery to Twelve Data.
+        results = await self._primary_or_fallback("search", query)
         stocks: list[Stock] = []
         seen_listings: set[tuple[str, str, str]] = set()
         for result in results:
@@ -375,8 +436,18 @@ class MarketDataService:
             stock.currency = data.get("currency") or stock.currency
         return stock
 
-    async def _primary_or_fallback(self, operation: str, symbol: str):
+    async def _provider_operation(self, provider: MarketDataProvider, operation: str, symbol: str, *, days: int | None = None):
+        method = getattr(provider, operation, None)
+        if operation == "history_for_days":
+            if method is not None:
+                return await method(symbol, days)
+            return await provider.history(symbol)
+        return await getattr(provider, operation)(symbol)
+
+    async def _primary_or_fallback(self, operation: str, symbol: str, *, days: int | None = None):
         started = perf_counter()
+        primary_name = getattr(self.provider, "provider_name", self.provider.__class__.__name__.lower())
+        fallback_name = getattr(self.fallback_provider, "provider_name", self.fallback_provider.__class__.__name__.lower()) if self.fallback_provider else None
         primary_on_cooldown = (
             operation == "quote"
             and self._primary_quote_unhealthy_until is not None
@@ -391,33 +462,31 @@ class MarketDataService:
         if (primary_on_cooldown or listing_on_cooldown) and self.fallback_provider is not None:
             fallback_started = perf_counter()
             try:
-                result = await getattr(self.fallback_provider, operation)(symbol)
+                result = await self._provider_operation(self.fallback_provider, operation, symbol, days=days)
                 logger.info(
-                    "market_timing provider=yahoo operation=%s symbol=%s elapsed_ms=%.1f primary_cooldown=%s listing_not_found_cooldown=%s",
-                    operation, symbol, (perf_counter() - fallback_started) * 1000, primary_on_cooldown, listing_on_cooldown,
+                    "market_timing provider=%s operation=%s symbol=%s elapsed_ms=%.1f primary_cooldown=%s listing_not_found_cooldown=%s",
+                    fallback_name, operation, symbol, (perf_counter() - fallback_started) * 1000, primary_on_cooldown, listing_on_cooldown,
                 )
                 return result
             except MarketDataError:
                 # Do not retry a provider deliberately placed on cooldown.
                 raise
         try:
-            result = await getattr(self.provider, operation)(symbol)
-            logger.info("market_timing provider=twelve operation=%s symbol=%s elapsed_ms=%.1f", operation, symbol, (perf_counter() - started) * 1000)
+            result = await self._provider_operation(self.provider, operation, symbol, days=days)
+            logger.info("market_timing provider=%s operation=%s symbol=%s elapsed_ms=%.1f", primary_name, operation, symbol, (perf_counter() - started) * 1000)
             return result
         except MarketDataError as primary_error:
-            logger.info("market_timing provider=twelve operation=%s symbol=%s elapsed_ms=%.1f failed=true reason=%s", operation, symbol, (perf_counter() - started) * 1000, primary_error.reason or primary_error.status_code)
+            logger.info("market_timing provider=%s operation=%s symbol=%s elapsed_ms=%.1f failed=true reason=%s", primary_name, operation, symbol, (perf_counter() - started) * 1000, primary_error.reason or primary_error.status_code)
             if operation == "quote" and primary_error.reason in {"timeout", "request_failed"}:
                 self._primary_quote_unhealthy_until = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=settings.market_primary_cooldown_seconds)
             if operation == "quote" and primary_error.status_code == 404:
                 self._primary_quote_not_found_until[symbol] = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=settings.market_primary_cooldown_seconds)
-            # A Twelve Data 429 is explicit and should reach the caller; a
-            # fallback retry would hide the rate-limit state and waste calls.
-            if primary_error.status_code == 429 or self.fallback_provider is None:
+            if self.fallback_provider is None:
                 raise
             try:
                 fallback_started = perf_counter()
-                result = await getattr(self.fallback_provider, operation)(symbol)
-                logger.info("market_timing provider=yahoo operation=%s symbol=%s elapsed_ms=%.1f", operation, symbol, (perf_counter() - fallback_started) * 1000)
+                result = await self._provider_operation(self.fallback_provider, operation, symbol, days=days)
+                logger.info("market_timing provider=%s operation=%s symbol=%s elapsed_ms=%.1f", fallback_name, operation, symbol, (perf_counter() - fallback_started) * 1000)
                 return result
             except MarketDataError:
                 raise primary_error
@@ -448,6 +517,10 @@ class MarketDataService:
                 exchange = stock.exchange
                 selected_provider_symbol = provider_symbol(symbol, exchange)
         if stock is None:
+            # The stock lookup above opened a read transaction. Return its
+            # connection before provider I/O; loaded scalar values remain safe
+            # because this session uses expire_on_commit=False.
+            db.commit()
             details = await self._primary_or_fallback("details", selected_provider_symbol)
             details["symbol"], details["exchange"] = SymbolNormalizer.listing(
                 details.get("symbol", symbol), details.get("exchange") or exchange
@@ -463,6 +536,8 @@ class MarketDataService:
             datetime.now(timezone.utc) - self._as_utc(stock.last_price_updated_at)
         ).total_seconds() > settings.market_cache_seconds
         if stale:
+            # Do not hold a database connection while obtaining a remote quote.
+            db.commit()
             try:
                 snapshot = await self.quote_snapshot_for_stock(stock)
                 # A stale snapshot is useful reference data but must retain its
@@ -549,25 +624,57 @@ class MarketDataService:
     async def history(self, symbol: str, *, exchange: str | None = None) -> list[StockHistoryPoint]:
         return await self.history_for_days(symbol, exchange=exchange, days=30)
 
+    @staticmethod
+    def _history_range(points: list[StockHistoryPoint], days: int) -> list[StockHistoryPoint]:
+        """Return the requested calendar range from a reusable wider series."""
+        if not points:
+            return []
+        latest = max(
+            point.timestamp.replace(tzinfo=timezone.utc) if point.timestamp.tzinfo is None else point.timestamp.astimezone(timezone.utc)
+            for point in points
+        )
+        cutoff = latest - timedelta(days=days - 1)
+        return [
+            point for point in points
+            if (point.timestamp.replace(tzinfo=timezone.utc) if point.timestamp.tzinfo is None else point.timestamp.astimezone(timezone.utc)) >= cutoff
+        ]
+
     async def history_for_days(self, symbol: str, *, exchange: str | None = None, days: int = 30) -> list[StockHistoryPoint]:
         base, selected_exchange = SymbolNormalizer.listing(symbol, exchange)
         now = datetime.now(timezone.utc)
         for (cached_symbol, cached_exchange, cached_days), (cached_at, cached_points) in self._history_cache.items():
             if (cached_symbol, cached_exchange) == (base, selected_exchange) and cached_days >= days and (now - cached_at).total_seconds() <= settings.market_history_cache_seconds:
-                return cached_points
+                return self._history_range(cached_points, days)
 
-        async def fetch(provider: MarketDataProvider) -> list[StockHistoryPoint]:
-            method = getattr(provider, "history_for_days", None)
-            return await method(provider_symbol(base, selected_exchange), days) if method else await provider.history(provider_symbol(base, selected_exchange))
+        # A wider in-flight series can satisfy a shorter consumer. Dashboard
+        # startup requests the wider series first, but this also protects a
+        # route hit at the same time from issuing the identical provider call.
+        task_key = next(
+            (key for key in self._history_tasks if key[0] == base and key[1] == selected_exchange and key[2] >= days),
+            (base, selected_exchange, days),
+        )
+        task = self._history_tasks.get(task_key)
+        if task is None:
+            async def load_history() -> list[StockHistoryPoint]:
+                points = await self._primary_or_fallback(
+                    "history_for_days", provider_symbol(base, selected_exchange), days=days
+                )
+                # Only a successful provider result reaches the authoritative
+                # history cache, so a failure cannot erase prior valid data.
+                self._history_cache[(base, selected_exchange, days)] = (datetime.now(timezone.utc), points)
+                return points
 
-        try:
-            points = await fetch(self.provider)
-        except MarketDataError as primary_error:
-            if primary_error.status_code == 429 or self.fallback_provider is None:
-                raise
-            try:
-                points = await fetch(self.fallback_provider)
-            except MarketDataError:
-                raise primary_error
-        self._history_cache[(base, selected_exchange, days)] = (now, points)
-        return points
+            task = asyncio.create_task(load_history())
+            self._history_tasks[task_key] = task
+
+            def clear_history_task(completed: asyncio.Task[list[StockHistoryPoint]]) -> None:
+                if self._history_tasks.get(task_key) is completed:
+                    self._history_tasks.pop(task_key, None)
+                if not completed.cancelled():
+                    try:
+                        completed.exception()
+                    except (asyncio.CancelledError, MarketDataError):
+                        pass
+
+            task.add_done_callback(clear_history_task)
+        return self._history_range(await asyncio.shield(task), days)

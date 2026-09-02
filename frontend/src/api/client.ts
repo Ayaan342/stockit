@@ -32,12 +32,14 @@ export function getStoredToken() {
 
 export function setStoredToken(token: string) {
   localStorage.setItem(tokenKey, token)
-  invalidate('me')
+  // Every protected result is scoped to the current identity. A token change
+  // must never reuse a prior user's short-lived portfolio/watchlist cache.
+  cache.clear()
 }
 
 export function clearStoredToken() {
   localStorage.removeItem(tokenKey)
-  invalidate('me')
+  cache.clear()
 }
 
 function errorMessage(payload: unknown): string {

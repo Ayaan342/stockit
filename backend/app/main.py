@@ -15,7 +15,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.state.market_service = MarketDataService(TwelveDataProvider(), YahooFinanceProvider())
+# Yahoo provides the primary quote/details/history path for the markets StockIt
+# tracks. Twelve Data remains available as the service-level fallback and for
+# listing search when Yahoo cannot provide a search result.
+app.state.market_service = MarketDataService(YahooFinanceProvider(), TwelveDataProvider())
 app.include_router(api_router)
 
 logger = logging.getLogger("uvicorn.error")

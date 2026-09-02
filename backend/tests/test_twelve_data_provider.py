@@ -7,7 +7,9 @@ import pandas as pd
 import pytest
 
 from app.models.stock import Stock
+from app.schemas.stock import StockHistoryPoint
 from app.services.market_data import MarketDataError, MarketDataProvider, MarketDataService, SymbolNormalizer, TwelveDataProvider, YahooFinanceProvider
+from app.services.portfolio_history import _market_date
 
 
 def provider_with(handler) -> TwelveDataProvider:
@@ -185,6 +187,8 @@ def test_symbol_normalizer_keeps_exchange_aliases_provider_specific():
     assert SymbolNormalizer.yahoo("TCS", "NSE") == "TCS.NS"
     assert SymbolNormalizer.yahoo("500325", "BSE") == "500325.BO"
     assert SymbolNormalizer.yahoo("AAPL", "NASDAQ") == "AAPL"
+    assert SymbolNormalizer.listing("AAPL", "NMS") == ("AAPL", "NASDAQ")
+    assert SymbolNormalizer.listing("AAPL", "NYQ") == ("AAPL", "NYSE")
 
 
 def test_concurrent_listing_quotes_share_one_provider_call():
@@ -311,3 +315,159 @@ def test_twelve_listing_not_found_uses_yahoo_directly_on_the_next_quote():
         assert fallback_calls == 2
     finally:
         settings.market_primary_cooldown_seconds = previous_cooldown
+
+
+def test_yahoo_primary_skips_twelve_for_us_nse_and_bse_quotes():
+    requested: list[str] = []
+    twelve_calls: list[str] = []
+
+    class Ticker:
+        fast_info = {"last_price": "123.45"}
+
+    class Twelve(MarketDataProvider):
+        provider_name = "twelve"
+        async def search(self, query: str): return []
+        async def quote(self, symbol: str):
+            twelve_calls.append(symbol)
+            return Decimal("999")
+        async def details(self, symbol: str): return {}
+        async def history(self, symbol: str): return []
+
+    yahoo = YahooFinanceProvider(ticker_factory=lambda symbol: requested.append(symbol) or Ticker())
+    service = MarketDataService(yahoo, Twelve())
+
+    async def quote_all():
+        return await asyncio.gather(
+            service._primary_or_fallback("quote", "AAPL"),
+            service._primary_or_fallback("quote", "TCS:NSE"),
+            service._primary_or_fallback("quote", "500325:BSE"),
+        )
+
+    assert asyncio.run(quote_all()) == [Decimal("123.45")] * 3
+    assert requested == ["AAPL", "TCS.NS", "500325.BO"]
+    assert twelve_calls == []
+
+
+def test_yahoo_failure_uses_twelve_fallback_and_caches_the_real_quote():
+    calls: list[str] = []
+
+    class YahooUnavailable(MarketDataProvider):
+        provider_name = "yahoo"
+        async def search(self, query: str): raise MarketDataError(status_code=503)
+        async def quote(self, symbol: str):
+            calls.append(f"yahoo:{symbol}")
+            raise MarketDataError(status_code=503)
+        async def details(self, symbol: str): raise MarketDataError(status_code=503)
+        async def history(self, symbol: str): raise MarketDataError(status_code=503)
+
+    class Twelve(MarketDataProvider):
+        provider_name = "twelve"
+        async def search(self, query: str): return []
+        async def quote(self, symbol: str):
+            calls.append(f"twelve:{symbol}")
+            return Decimal("3500")
+        async def details(self, symbol: str): return {}
+        async def history(self, symbol: str): return []
+
+    service = MarketDataService(YahooUnavailable(), Twelve())
+    stock = Stock(symbol="TCS", exchange="NSE", name="TCS", currency="INR")
+
+    async def resolve_twice():
+        return await service.quote_for_stock(stock), await service.quote_for_stock(stock)
+
+    assert asyncio.run(resolve_twice()) == (Decimal("3500.000000"), Decimal("3500.000000"))
+    assert calls == ["yahoo:TCS:NSE", "twelve:TCS:NSE"]
+
+
+def test_history_uses_yahoo_before_twelve_fallback():
+    calls: list[str] = []
+
+    class Yahoo(MarketDataProvider):
+        provider_name = "yahoo"
+        async def search(self, query: str): return []
+        async def quote(self, symbol: str): return Decimal("1")
+        async def details(self, symbol: str): return {}
+        async def history(self, symbol: str):
+            calls.append(f"yahoo:{symbol}")
+            return [StockHistoryPoint(timestamp=datetime.now(timezone.utc), close=Decimal("3500"))]
+
+    class Twelve(MarketDataProvider):
+        provider_name = "twelve"
+        async def search(self, query: str): return []
+        async def quote(self, symbol: str): return Decimal("1")
+        async def details(self, symbol: str): return {}
+        async def history(self, symbol: str):
+            calls.append(f"twelve:{symbol}")
+            return []
+
+    service = MarketDataService(Yahoo(), Twelve())
+    points = asyncio.run(service.history_for_days("TCS", exchange="NSE", days=30))
+    assert [point.close for point in points] == [Decimal("3500")]
+    assert calls == ["yahoo:TCS:NSE"]
+
+
+def test_empty_yahoo_history_uses_twelve_fallback():
+    calls: list[str] = []
+
+    class EmptyTicker:
+        def history(self, **kwargs):
+            return pd.DataFrame()
+
+    class Twelve(MarketDataProvider):
+        provider_name = "twelve"
+        async def search(self, query: str): return []
+        async def quote(self, symbol: str): return Decimal("1")
+        async def details(self, symbol: str): return {}
+        async def history(self, symbol: str):
+            calls.append(symbol)
+            return [StockHistoryPoint(timestamp=datetime.now(timezone.utc), close=Decimal("3500"))]
+
+    service = MarketDataService(YahooFinanceProvider(ticker_factory=lambda _: EmptyTicker()), Twelve())
+    points = asyncio.run(service.history_for_days("TCS", exchange="NSE", days=30))
+
+    assert [point.close for point in points] == [Decimal("3500")]
+    assert calls == ["TCS:NSE"]
+
+
+def test_yahoo_history_keeps_valid_closes_when_the_latest_row_is_nan():
+    requested: list[str] = []
+    calls: list[dict] = []
+
+    class Ticker:
+        def history(self, **kwargs):
+            calls.append(kwargs)
+            return pd.DataFrame(
+                {"Close": [Decimal("2342"), float("nan")]},
+                index=pd.DatetimeIndex(["2026-08-31", "2026-09-01"], tz="Asia/Kolkata"),
+            )
+
+    provider = YahooFinanceProvider(ticker_factory=lambda symbol: requested.append(symbol) or Ticker())
+    points = asyncio.run(provider.history_for_days("TCS:NSE", 400))
+
+    assert requested == ["TCS.NS"]
+    assert calls == [{"period": "1y", "interval": "1d", "auto_adjust": False}]
+    assert [(point.timestamp.date(), point.close) for point in points] == [(datetime(2026, 8, 30, tzinfo=timezone.utc).date(), Decimal("2342"))]
+    # Yahoo's local NSE midnight is intentionally represented as the prior UTC
+    # day. Consumers must recover the listing's Asia/Kolkata market date.
+    assert _market_date(points[0].timestamp, "NSE") == datetime(2026, 8, 31).date()
+
+
+def test_all_nan_yahoo_history_is_unusable_and_falls_back_to_twelve():
+    class Ticker:
+        def history(self, **kwargs):
+            return pd.DataFrame(
+                {"Close": [float("nan")]},
+                index=pd.DatetimeIndex(["2026-09-01"], tz="Asia/Kolkata"),
+            )
+
+    class Twelve(MarketDataProvider):
+        async def search(self, query: str): return []
+        async def quote(self, symbol: str): return Decimal("1")
+        async def details(self, symbol: str): return {}
+        async def history(self, symbol: str):
+            return [StockHistoryPoint(timestamp=datetime.now(timezone.utc), close=Decimal("2399.3"))]
+
+    service = MarketDataService(YahooFinanceProvider(ticker_factory=lambda _: Ticker()), Twelve())
+    points = asyncio.run(service.history_for_days("M&M:NSE", exchange="NSE", days=30))
+
+    assert [point.close for point in points] == [Decimal("2399.3")]

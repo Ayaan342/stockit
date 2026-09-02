@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     market_data_api_key: str = Field(default="", validation_alias="MARKET_DATA_API_KEY")
     market_data_base_url: str = "https://api.twelvedata.com"
     market_data_timeout_seconds: float = Field(default=4.0, gt=0, le=15, validation_alias="MARKET_DATA_TIMEOUT_SECONDS")
-    market_cache_seconds: int = Field(default=60, ge=0, le=3600)
+    market_cache_seconds: int = Field(default=45, ge=0, le=3600, validation_alias="MARKET_CACHE_SECONDS")
     market_stale_cache_seconds: int = Field(default=900, ge=60, le=86400, validation_alias="MARKET_STALE_CACHE_SECONDS")
     market_primary_cooldown_seconds: int = Field(default=30, ge=0, le=600, validation_alias="MARKET_PRIMARY_COOLDOWN_SECONDS")
     market_history_cache_seconds: int = Field(default=3600, ge=60, le=86400, validation_alias="MARKET_HISTORY_CACHE_SECONDS")

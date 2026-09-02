@@ -8,6 +8,7 @@ import { MarketSelector } from '../components/MarketSelector'
 import { PortfolioHistoryChart } from '../components/PortfolioHistoryChart'
 import type { Holding, Portfolio, PortfolioHistory, Transaction, Watchlist } from '../types/api'
 import { dateTime, money, number, pnlClass } from '../utils/format'
+import { recentPortfolioHistory } from '../utils/portfolioHistory'
 
 export function DashboardPage() {
   const [portfolio, setPortfolio] = useState<Portfolio>()
@@ -16,7 +17,6 @@ export function DashboardPage() {
   const [holdings, setHoldings] = useState<Holding[]>([])
   const [error, setError] = useState('')
   const [selectedCurrency, setSelectedCurrency] = useState('')
-  const [shortHistory, setShortHistory] = useState<PortfolioHistory>()
   const [growthHistory, setGrowthHistory] = useState<PortfolioHistory>()
 
   useEffect(() => {
@@ -35,13 +35,23 @@ export function DashboardPage() {
   useEffect(() => {
     if (!selectedCurrency) return
     let active = true
-    Promise.all([api.portfolioHistory(selectedCurrency, '30d'), api.portfolioHistory(selectedCurrency, '1y')])
-      .then(([short, growth]) => { if (active) { setShortHistory(short as PortfolioHistory); setGrowthHistory(growth as PortfolioHistory) } })
-      .catch(() => { if (active) { setShortHistory({ currency: selectedCurrency, period: '30d', complete: false, points: [] }); setGrowthHistory({ currency: selectedCurrency, period: '1y', complete: false, points: [] }) } })
+    // The 1-year ledger series already contains the last 30 calendar days.
+    // Fetch it once, then derive the shorter display range locally instead of
+    // doubling provider-backed portfolio-history work on dashboard startup.
+    api.portfolioHistory(selectedCurrency, '1y')
+      .then((growth) => { if (active) setGrowthHistory(growth as PortfolioHistory) })
+      .catch(() => {
+        if (!active) return
+        // Preserve valid data for a refresh of the same market. A first load
+        // for another market still receives the existing unavailable state.
+        setGrowthHistory((current) => current?.currency === selectedCurrency
+          ? current
+          : { currency: selectedCurrency, period: '1y', complete: false, points: [] })
+      })
     return () => { active = false }
   }, [selectedCurrency])
 
-  const selectMarket = (currency: string) => { setShortHistory(undefined); setGrowthHistory(undefined); setSelectedCurrency(currency) }
+  const selectMarket = (currency: string) => { setSelectedCurrency(currency) }
 
   if (error) return <ErrorState message={error} />
   if (!portfolio) return <Loading />
@@ -52,6 +62,8 @@ export function DashboardPage() {
   const bestHolding = rankedHoldings[0]
   const worstHolding = rankedHoldings[rankedHoldings.length - 1]
   const chartCurrency = activeGroup?.currency
+  const activeGrowthHistory = growthHistory?.currency === activeGroup?.currency ? growthHistory : undefined
+  const shortHistory = activeGrowthHistory ? recentPortfolioHistory(activeGrowthHistory, 30) : undefined
 
   return <>
     <section className="page-heading">
@@ -64,7 +76,7 @@ export function DashboardPage() {
       <MetricCard label="Total invested" value={money(activeGroup.total_invested, activeGroup.currency)} />
       <MetricCard label="Total P/L" tone={pnlClass(activeGroup.total_profit_loss)} value={money(activeGroup.total_profit_loss, activeGroup.currency)} detail={activeGroup.profit_loss_percentage === null ? 'Market data unavailable' : `${activeGroup.profit_loss_percentage}% overall`} />
     </section></section>}
-    <section className="portfolio-chart-grid"><article className="panel portfolio-growth-panel"><div className="panel-heading"><div><p className="eyebrow">Portfolio growth</p><h2>12 months</h2></div></div><PortfolioHistoryChart history={growthHistory} monthly /></article><article className="panel allocation-panel">
+    <section className="portfolio-chart-grid"><article className="panel portfolio-growth-panel"><div className="panel-heading"><div><p className="eyebrow">Portfolio growth</p><h2>12 months</h2></div></div><PortfolioHistoryChart history={activeGrowthHistory} monthly /></article><article className="panel allocation-panel">
       <div className="panel-heading"><div><h2>Holdings allocation</h2><p className="muted">Current market value by position</p></div></div>
       <AllocationDonut holdings={activeHoldings} currency={activeGroup?.currency} />
     </article></section>
