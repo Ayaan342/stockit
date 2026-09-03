@@ -21,11 +21,11 @@ function NavIcon({ name }: { name: string }) {
 export function AppShell() {
   const { user, logout } = useAuth()
   const navigate = useNavigate()
-  const signOut = () => { logout(); navigate('/login') }
+  const signOut = () => { logout(); navigate('/') }
   return <div className="app-shell">
     <aside className="sidebar">
       <NavLink className="brand" to="/portfolio"><span className="brand-mark">S</span><span>StockIt<small>Portfolio tracker</small></span></NavLink>
-      <nav className="side-nav" aria-label="Main navigation">{links.map(([to, label, icon]) => <NavLink key={to} to={to}><NavIcon name={icon} /><span>{label}</span></NavLink>)}</nav>
+      <nav className="side-nav" aria-label="Main navigation">{links.map(([to, label, icon]) => <NavLink key={to} to={to} aria-label={label}><NavIcon name={icon} /><span>{label}</span></NavLink>)}</nav>
       <div className="sidebar-footer"><div className="avatar">{(user?.name || user?.email || 'U').charAt(0).toUpperCase()}</div><div><strong>{user?.name || 'Investor'}</strong><small>{user?.email}</small></div><button className="logout" onClick={signOut} aria-label="Log out">↗</button></div>
     </aside>
     <div className="content-shell"><header className="topbar"><button className="logout" onClick={signOut}>Log out</button></header><header className="mobile-header"><NavLink className="brand" to="/overview"><span className="brand-mark">S</span> StockIt</NavLink><button className="logout" onClick={signOut}>Log out</button></header><nav className="mobile-nav" aria-label="Mobile navigation">{links.map(([to, label]) => <NavLink key={to} to={to}>{label}</NavLink>)}</nav><main className="page"><Outlet /></main></div>

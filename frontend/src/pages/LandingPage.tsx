@@ -13,6 +13,30 @@ const capabilities: Array<{ icon: IconName; title: string; body: string }> = [
   { icon: 'transactions', title: 'Transaction ledger', body: 'Keep an immutable record of recorded buys and sells in one place.' },
 ]
 
+const previewMetrics = [
+  { label: 'Portfolio value', value: '₹8,36,420', meta: 'as of today' },
+  { label: 'Total invested', value: '₹7,42,000', meta: 'across 11 holdings' },
+  { label: 'Total P/L', value: '+₹94,420', meta: 'unrealized', positive: true },
+  { label: 'Return %', value: '+12.72%', meta: 'since inception', positive: true },
+]
+
+const previewNav: Array<{ label: string; icon: IconName }> = [
+  { label: 'Portfolio', icon: 'portfolio' },
+  { label: 'Holdings', icon: 'holdings' },
+  { label: 'Buy / Sell', icon: 'trade' },
+  { label: 'Analytics', icon: 'analytics' },
+  { label: 'Watchlist', icon: 'watchlist' },
+  { label: 'Transactions', icon: 'transactions' },
+]
+
+const previewHoldings = [
+  { symbol: 'INFY', exchange: 'NSE', quantity: '120', value: '₹2,18,400', profitLoss: '+12.4%', positive: true },
+  { symbol: 'HDFCBANK', exchange: 'NSE', quantity: '85', value: '₹1,84,250', profitLoss: '+6.1%', positive: true },
+  { symbol: 'TCS', exchange: 'BSE', quantity: '40', value: '₹1,59,720', profitLoss: '+9.8%', positive: true },
+  { symbol: 'RELIANCE', exchange: 'NSE', quantity: '60', value: '₹1,47,900', profitLoss: '−3.2%', positive: false },
+  { symbol: 'ITC', exchange: 'NSE', quantity: '300', value: '₹1,26,150', profitLoss: '−1.7%', positive: false },
+]
+
 function Reveal({ children, className = '' }: { children: ReactNode; className?: string }) {
   const ref = useRef<HTMLDivElement>(null)
   const [visible, setVisible] = useState(() => typeof IntersectionObserver === 'undefined')
@@ -52,10 +76,10 @@ function Brand() {
   return <Link className="landing-brand" to="/"><span className="landing-brand-mark">S</span><span>StockIt</span></Link>
 }
 
-function Ctas({ centered = false }: { centered?: boolean }) {
+function Ctas({ centered = false, subtleSignIn = false }: { centered?: boolean; subtleSignIn?: boolean }) {
   return <div className={`landing-ctas ${centered ? 'landing-ctas-centered' : ''}`}>
     <Link className="landing-primary-cta" to="/register">Get started <span aria-hidden="true">→</span></Link>
-    <Link className="landing-secondary-cta" to="/login">Sign in</Link>
+    {subtleSignIn && <p className="landing-account-link">Already have an account? <Link to="/login">Sign in</Link></p>}
   </div>
 }
 
@@ -64,21 +88,35 @@ function PreviewChart() {
 }
 
 function AllocationPreview() {
-  return <div className="landing-allocation"><div className="landing-donut"><span>Allocation</span></div><div className="landing-preview-legend"><span><i className="dot-a" />NSE equities</span><span><i className="dot-b" />BSE equities</span><span><i className="dot-c" />US equities</span></div></div>
+  return <div className="landing-allocation"><div className="landing-donut"><span>Allocation</span></div><div className="landing-preview-legend"><span><i className="dot-a" />INFY <b>26%</b></span><span><i className="dot-b" />HDFCBANK <b>22%</b></span><span><i className="dot-c" />TCS <b>19%</b></span><span><i className="dot-d" />RELIANCE <b>18%</b></span><span><i className="dot-e" />ITC <b>15%</b></span></div></div>
 }
+
+const previewGainLoss = [
+  { symbol: 'INFY', value: 34, width: 44 },
+  { symbol: 'TCS', value: 21, width: 31 },
+  { symbol: 'HDFCBANK', value: 12, width: 19 },
+  { symbol: 'RELIANCE', value: -9, width: 15 },
+  { symbol: 'ITC', value: -17, width: 24 },
+]
 
 function GainLossPreview() {
-  return <div className="landing-gain-loss"><div><span>Holding A</span><i className="gain gain-wide" /><b className="positive">+12.4%</b></div><div><span>Holding B</span><i className="gain gain-medium" /><b className="positive">+6.1%</b></div><div><span>Holding C</span><i className="loss loss-medium" /><b className="negative">−3.2%</b></div></div>
+  return <div className="landing-gain-loss">{previewGainLoss.map((holding) => {
+    const positive = holding.value >= 0
+    return <div key={holding.symbol}><span>{holding.symbol}</span><span className="landing-gain-track"><i className={positive ? 'gain' : 'loss'} style={{ width: `${holding.width}%` }} /></span><b className={positive ? 'positive' : 'negative'}>{positive ? '+' : '−'}{Math.abs(holding.value)}%</b></div>
+  })}</div>
 }
 
-function DashboardPreview({ compact = false }: { compact?: boolean }) {
-  return <div className={`landing-preview ${compact ? 'landing-preview-compact' : ''}`} aria-label="Illustrative StockIt dashboard preview">
+function DashboardPreview({ showcase = false }: { showcase?: boolean }) {
+  return <div className={`landing-preview ${showcase ? 'landing-preview-showcase' : 'landing-preview-hero'}`} aria-label="Illustrative StockIt dashboard preview">
     <div className="landing-browser-bar"><span><i /><i /><i /></span><code>app.stockit.io / portfolio</code></div>
-    <div className="landing-preview-body">
-      <div className="landing-preview-title"><div><strong>Portfolio</strong><small>Illustrative portfolio preview</small></div><div className="landing-preview-market"><b>India · INR</b><span>US · USD</span></div></div>
-      <div className="landing-preview-metrics"><div><span>Portfolio value</span><b>₹8,36,420</b></div><div><span>Total invested</span><b>₹7,42,000</b></div><div><span>Total P/L</span><b className="positive">+₹94,420</b></div><div><span>Return</span><b className="positive">+12.72%</b></div></div>
-      <div className="landing-preview-grid"><section><header>Portfolio value · 12 months <small>INR</small></header><PreviewChart /></section><section><header>Allocation</header><AllocationPreview /></section></div>
-      <section className="landing-preview-gain"><header>Gain / loss by holding <small>unrealized</small></header><GainLossPreview /></section>
+    <div className="landing-preview-app">
+      {showcase && <aside className="landing-preview-sidebar" aria-hidden="true"><div className="landing-preview-brand"><span>S</span><b>StockIt</b></div><div className="landing-preview-nav">{previewNav.map((item) => <span className={item.label === 'Portfolio' ? 'active' : ''} key={item.label}><LandingIcon name={item.icon} /><b>{item.label}</b></span>)}</div></aside>}
+      <div className="landing-preview-body">
+        <div className="landing-preview-title"><div><strong>Portfolio</strong><small>{showcase ? 'India and US portfolios are tracked separately' : 'Illustrative portfolio preview'}</small></div><div className="landing-preview-market"><b>India · INR</b><span>US · USD</span></div></div>
+        <div className="landing-preview-metrics">{previewMetrics.map((metric) => <div key={metric.label}><span>{metric.label}</span><b className={metric.positive ? 'positive' : ''}>{metric.value}</b>{showcase && <small>{metric.meta}</small>}</div>)}</div>
+        <div className="landing-preview-grid"><section><header>Portfolio value · 12 months <small>INR</small></header><PreviewChart /><div className="landing-preview-months"><span>Sep</span><span>Nov</span><span>Jan</span><span>Mar</span><span>May</span><span>Jul</span></div></section><section><header>Allocation <small>by value</small></header><AllocationPreview /></section></div>
+        {showcase ? <div className="landing-preview-lower"><section className="landing-preview-gain"><header>Gain / loss by holding <small>unrealized</small></header><GainLossPreview /></section><section className="landing-preview-holdings"><header>Top holdings <small>5 of 11</small></header><table><thead><tr><th>Symbol</th><th>Qty</th><th>Value</th><th>P/L</th></tr></thead><tbody>{previewHoldings.map((holding) => <tr key={holding.symbol}><td><b>{holding.symbol}</b><small>{holding.exchange}</small></td><td>{holding.quantity}</td><td>{holding.value}</td><td className={holding.positive ? 'positive' : 'negative'}>{holding.profitLoss}</td></tr>)}</tbody></table></section></div> : <section className="landing-preview-gain landing-preview-hero-gain"><header>Gain / loss by holding <small>unrealized</small></header><GainLossPreview /></section>}
+      </div>
     </div>
   </div>
 }
@@ -99,16 +137,16 @@ export function LandingPage() {
   return <div className="landing-page">
     <header className="landing-nav"><div className="landing-shell"><Brand /><nav aria-label="Landing navigation"><a href="#capabilities">Capabilities</a><a href="#how-it-works">How it works</a><a href="#markets">Markets</a></nav><div className="landing-nav-actions"><Link to="/login">Sign in</Link><Link className="landing-nav-cta" to="/register">Get started</Link></div></div></header>
     <main>
-      <section className="landing-hero"><div className="landing-shell landing-hero-grid"><Reveal className="landing-hero-copy"><p className="landing-kicker">Portfolio tracker · NSE · BSE · US</p><h1>Track your portfolio with clarity.</h1><p>Record real investment transactions, track NSE, BSE and US equities, and understand portfolio performance over time.</p><Ctas /><small className="landing-scope">Tracking only · StockIt does not execute trades</small></Reveal><Reveal className="landing-hero-preview"><DashboardPreview /></Reveal></div></section>
+      <section className="landing-hero"><div className="landing-shell landing-hero-grid"><Reveal className="landing-hero-copy"><p className="landing-kicker">Portfolio tracker · NSE · BSE · US</p><h1>Track your portfolio with clarity.</h1><p>Record the trades you make through your broker, track NSE, BSE, and US holdings, and see your portfolio value, allocation, and profit/loss in one place.</p><Ctas subtleSignIn /><small className="landing-scope">Tracking only · StockIt does not execute trades</small></Reveal><Reveal className="landing-hero-preview"><DashboardPreview /></Reveal></div></section>
       <section className="landing-trust-strip"><div className="landing-shell"><span>NSE equities</span><span>BSE equities</span><span>US equities</span><span>Transaction-backed tracking</span><span>Native INR / USD views</span></div></section>
       <section id="capabilities" className="landing-section landing-capabilities"><div className="landing-shell"><Reveal className="landing-section-heading"><p className="landing-kicker">Capabilities</p><h2>Everything you need to understand your portfolio.</h2></Reveal><div className="landing-capability-grid">{capabilities.map((capability) => <Reveal key={capability.title}><article><span className="landing-capability-icon"><LandingIcon name={capability.icon} /></span><h3>{capability.title}</h3><p>{capability.body}</p></article></Reveal>)}</div></div></section>
-      <section className="landing-section landing-showcase"><div className="landing-shell"><Reveal className="landing-showcase-intro"><p className="landing-kicker">The product</p><h2>A portfolio workspace built for real positions.</h2><p>StockIt tracks investments you have already made through your broker. It keeps recorded transactions, holdings, performance, and allocation in one focused workspace.</p></Reveal><Reveal className="landing-showcase-preview"><DashboardPreview compact /></Reveal></div></section>
+      <section className="landing-section landing-showcase"><div className="landing-shell"><Reveal className="landing-showcase-intro"><p className="landing-kicker">The product</p><h2>A portfolio workspace built for real positions.</h2><p>StockIt tracks investments you have already made through your broker. It keeps recorded transactions, holdings, performance, and allocation in one focused workspace.</p></Reveal><Reveal className="landing-showcase-preview"><DashboardPreview showcase /></Reveal></div></section>
       <section className="landing-section landing-product-sections"><div className="landing-shell"><Reveal className="landing-product-row"><div><p className="landing-kicker">Portfolio tracking</p><h2>See your positions in their native market context.</h2><p>Review holdings, invested value, current value, and realized or unrealized P/L without blending INR and USD portfolios.</p></div><PortfolioShowcase /></Reveal><Reveal className="landing-product-row landing-product-row-reverse"><div><p className="landing-kicker">Analytics</p><h2>Understand allocation and holding-level performance.</h2><p>Use current valuation, gain or loss by holding, and portfolio history to see what is contributing to performance.</p></div><AnalyticsShowcase /></Reveal><Reveal className="landing-product-row"><div><p className="landing-kicker">Record transactions</p><h2>Keep the trade you made, not a broker simulation.</h2><p>Record the actual execution details from your broker. StockIt uses those records to update your holdings and performance.</p></div><TransactionsShowcase /></Reveal></div></section>
       <section id="how-it-works" className="landing-section landing-steps"><div className="landing-shell"><Reveal className="landing-section-heading"><p className="landing-kicker">How it works</p><h2>Three steps from transactions to clarity.</h2></Reveal><ol><li><span>01</span><h3>Record your trades</h3><p>Enter the buys and sells you already completed through your broker.</p></li><li><span>02</span><h3>Track your holdings</h3><p>StockIt reconstructs positions, invested value, and portfolio performance.</p></li><li><span>03</span><h3>Understand performance</h3><p>Use allocation, P/L, history, analytics, and watchlists to monitor investments.</p></li></ol></div></section>
       <section id="markets" className="landing-section landing-markets"><div className="landing-shell landing-markets-grid"><Reveal><p className="landing-kicker">Market coverage</p><h2>Indian and US equities, tracked separately.</h2><p>StockIt supports listings across NSE, BSE, and US markets. INR and USD portfolios stay separate, with no forced base-currency conversion.</p></Reveal><Reveal className="landing-market-list"><div><b>NSE</b><span><strong>National Stock Exchange</strong><small>India · INR</small></span></div><div><b>BSE</b><span><strong>Bombay Stock Exchange</strong><small>India · INR</small></span></div><div><b>US</b><span><strong>US equities</strong><small>United States · USD</small></span></div></Reveal></div></section>
-      <section className="landing-section landing-transparency"><div className="landing-shell"><Reveal><article><span><LandingIcon name="shield" /></span><div><p className="landing-kicker">Clear boundaries</p><h2>StockIt tracks investments. It does not execute trades or provide investment advice.</h2><p>Record transactions made through your existing broker, then use StockIt to monitor your holdings, performance, and portfolio analytics.</p></div></article></Reveal></div></section>
-      <section className="landing-final"><div className="landing-shell"><Reveal><h2>Your portfolio, clearly understood.</h2><p>Bring recorded trades into one clear view of holdings, performance, and allocation.</p><Ctas centered /></Reveal></div></section>
+      <section className="landing-section landing-transparency"><div className="landing-shell"><Reveal><article><span><LandingIcon name="shield" /></span><div><p className="landing-kicker">Clear boundaries</p><h2>StockIt tracks your portfolio. It does not execute trades.</h2><p>Record transactions made through your existing broker, then use StockIt to monitor your holdings, performance, and portfolio analytics.</p></div></article></Reveal></div></section>
+      <section className="landing-final"><div className="landing-shell"><Reveal><h2>Know exactly where your portfolio stands.</h2><p>Record your trades, track your holdings, and understand your performance without spreadsheets or scattered broker statements.</p><Ctas centered /></Reveal></div></section>
     </main>
-    <footer className="landing-footer"><div className="landing-shell"><div><Brand /><p>An equity portfolio tracker for NSE, BSE, and US listings.</p></div><span>Portfolio tracking · not a broker</span></div></footer>
+    <footer className="landing-footer"><div className="landing-shell"><div><Brand /><p>StockIt tracks your portfolio. It does not execute trades.</p></div><span>Portfolio tracking · NSE · BSE · US</span></div></footer>
   </div>
 }
