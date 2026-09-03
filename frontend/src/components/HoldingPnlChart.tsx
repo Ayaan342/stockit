@@ -47,8 +47,9 @@ export function HoldingPnlChart({ holdings, currency }: HoldingPnlChartProps) {
   if (!data.length) return <p className="muted compact-empty">Market data unavailable for holding-level analysis.</p>
 
   const limit = symmetricLimit(data.map((holding) => holding.value))
+  const chartHeight = Math.min(360, Math.max(176, data.length * 46 + 36))
   return <div className="holding-pnl-chart" aria-label="Diverging unrealized profit and loss by holding">
-    <ResponsiveContainer width="100%" height={Math.max(250, data.length * 46)}>
+    <ResponsiveContainer width="100%" height={chartHeight}>
       <BarChart data={data} layout="vertical" margin={{ top: 4, right: 18, bottom: 4, left: 4 }} barCategoryGap="27%">
         <XAxis
           type="number"

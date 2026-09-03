@@ -70,11 +70,13 @@ export function DashboardPage() {
       <div><p className="eyebrow">Portfolio</p><h1>Your portfolio</h1><p className="muted">Current value and transaction-aware market history in each native currency.</p></div>
     </section>
     <MarketSelector markets={portfolio.groups.map((group) => ({ currency: group.currency, market: group.market_group }))} selected={activeGroup?.currency ?? ''} onSelect={selectMarket} />
-    {activeGroup && <section><div className="panel-heading"><div><p className="eyebrow">{activeGroup.market_group}</p><h2>{activeGroup.currency} summary</h2></div></div><section className="metric-grid dashboard-metrics">
+    {activeGroup && <section className="dashboard-summary"><div className="panel-heading"><div><p className="eyebrow">{activeGroup.market_group}</p><h2>{activeGroup.currency} summary</h2></div></div><section className="dashboard-value-grid">
       <MetricCard featured label="Portfolio value" value={money(activeGroup.total_portfolio_value, activeGroup.currency)} detail={activeGroup.total_portfolio_value === null ? 'Market data unavailable' : 'Current holdings'} />
-      <MetricCard label="Holdings value" value={money(activeGroup.current_holdings_value, activeGroup.currency)} />
-      <MetricCard label="Total invested" value={money(activeGroup.total_invested, activeGroup.currency)} />
-      <MetricCard label="Total P/L" tone={pnlClass(activeGroup.total_profit_loss)} value={money(activeGroup.total_profit_loss, activeGroup.currency)} detail={activeGroup.profit_loss_percentage === null ? 'Market data unavailable' : `${activeGroup.profit_loss_percentage}% overall`} />
+      <div className="dashboard-support-metrics">
+        <MetricCard label="Holdings value" value={money(activeGroup.current_holdings_value, activeGroup.currency)} />
+        <MetricCard label="Total invested" value={money(activeGroup.total_invested, activeGroup.currency)} />
+        <MetricCard label="Total P/L" tone={pnlClass(activeGroup.total_profit_loss)} value={money(activeGroup.total_profit_loss, activeGroup.currency)} detail={activeGroup.profit_loss_percentage === null ? 'Market data unavailable' : `${activeGroup.profit_loss_percentage}% overall`} />
+      </div>
     </section></section>}
     <section className="portfolio-chart-grid"><article className="panel portfolio-growth-panel"><div className="panel-heading"><div><p className="eyebrow">Portfolio growth</p><h2>12 months</h2></div></div><PortfolioHistoryChart history={activeGrowthHistory} monthly /></article><article className="panel allocation-panel">
       <div className="panel-heading"><div><h2>Holdings allocation</h2><p className="muted">Current market value by position</p></div></div>
