@@ -8,10 +8,12 @@ import { TradePage } from './pages/TradePage'
 import { WatchlistsPage } from './pages/WatchlistsPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { AnalyticsPage } from './pages/AnalyticsPage'
+import { LandingPage } from './pages/LandingPage'
 
 function App() {
   return (
     <Routes>
+      <Route path="/" element={<LandingPage />} />
       <Route path="/login" element={<LoginPage />} />
       <Route path="/register" element={<RegisterPage />} />
       <Route element={<ProtectedRoute />}>
@@ -28,8 +30,7 @@ function App() {
           <Route path="/dashboard" element={<Navigate to="/overview" replace />} />
         </Route>
       </Route>
-      <Route path="/" element={<Navigate to="/overview" replace />} />
-      <Route path="*" element={<Navigate to="/overview" replace />} />
+      <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )
 }
